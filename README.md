@@ -221,3 +221,15 @@ python run_live.py --check
 **先看 `docs/FINDINGS.md`**：Rule 1–3 的入场逻辑是有效的（到达均值目标的交易
 100% 盈利），但默认的 Rule 5 ATR 止损与 Rule 2 的入场逻辑互相冲突，回测里它是
 亏损的主要来源。止损参数由负责 Rule 5 的队友决定，本仓库只提供可配置项与扫描工具。
+
+## 9. License
+
+MIT — see [LICENSE](LICENSE). The competition requires the submitted repository
+to be open source; a public repository without a licence is legally
+"all rights reserved", so this file is what makes that claim true. Swap it for
+Apache-2.0 or GPL if the team prefers, but do not remove it.
+
+> **Not investment advice, and not a live-money system.** This targets Roostoo's
+> mock exchange with a virtual portfolio. The backtest results in
+> `docs/FINDINGS.md` are negative; do not point this at real capital without
+> independent validation.
