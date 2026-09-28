@@ -65,12 +65,16 @@ class MeanReversionStrategy(Strategy):
             "adx_period": 14,
             "adx_max": 25.0,
             "require_adx": True,  # False = trade without the trend filter (A/B test)
-            # --- Rule 4 (teammate-owned) ------------------------------------
-            # Included because Rule 2 on its own fires on economically trivial
-            # moves: in a very quiet market a 2-sigma deviation can be smaller
-            # than the 0.2% round-trip commission.
+            # --- Rule 4 (owned by a teammate -- OFF by default) --------------
+            # This gate belongs to Rule 4, which is outside this module's scope, so
+            # it ships disabled: Rules 1-3 must not silently execute someone
+            # else's rule. It is worth measuring, though -- Rule 2 on its own does
+            # fire on economically trivial moves (in a quiet market a 2-sigma
+            # deviation can be smaller than the 0.2% round-trip commission), and
+            # docs/FINDINGS.md section 4 shows it helping at every z-entry level.
+            # Enable with: STRATEGY_PARAMS='{"enforce_min_deviation": true}'
             "min_abs_deviation": 0.006,  # |Close - SMA48| / Close > 0.6%
-            "enforce_min_deviation": True,
+            "enforce_min_deviation": False,
             # --- Rule 5 inputs (teammate-owned) -----------------------------
             "atr_period": 14,  # ATR is reported in meta; the stop itself is risk.py's job
             # --- direction --------------------------------------------------

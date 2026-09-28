@@ -15,6 +15,16 @@ python run_sweep.py --config-grid "@reports/grid_stop.json"
 python run_sweep.py --grid "@reports/grid_direction.json" --config-grid "@reports/grid_exit.json"
 ```
 
+> **Configuration note.** Sections 1–3 were produced with **Rule 4's deviation
+> gate enabled** (`enforce_min_deviation: true`), which is how those tables were
+> obtained. That gate belongs to another owner, so it now ships **disabled** and
+> the shipped default is worse on its own: in-sample −18.6% rather than −14.3%
+> (section 4 has the full comparison, and it is the same conclusion either way).
+> To reproduce these exact figures, add `"enforce_min_deviation": true` to
+> `STRATEGY_PARAMS`, or pass `--params '{"enforce_min_deviation": true}'`.
+> On Windows/PowerShell, inline JSON is mangled by the shell — use the `@file`
+> form instead.
+
 **Headline: as specified, Rules 1–3 lose money — and the entry logic is not the
 reason.** Two configuration choices cause almost all of the damage, and both are
 owned by teammates (Rules 5 and the short leg of Rule 2).
