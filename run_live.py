@@ -23,6 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from roostoo import config as config_mod  # noqa: E402
+from roostoo.basis import BasisMonitor  # noqa: E402
 from roostoo.client import build_client  # noqa: E402
 from roostoo.engine import TradingEngine  # noqa: E402
 from roostoo.journal import Journal  # noqa: E402
@@ -86,6 +87,34 @@ def run_check(cfg) -> int:
     except Exception as exc:
         print(f"tickers          FAIL {exc}")
         problems.append("ticker endpoint failed")
+
+    # The organisers confirmed the mock venue tracks Binance. Verify it once,
+    # read-only: if the basis is wide, every Rules 2-3 signal is being computed
+    # against a feed that has drifted, and the fix is the symbol mapping or the
+    # feed, not the strategy.
+    try:
+        report = BasisMonitor(timeout=cfg.request_timeout_sec).check(tickers)
+        if report.source_ok:
+            print(f"\nbasis vs Binance  OK   tolerance +/-{report.threshold_pct * 100:.2f}%")
+            print(f"    {'pair':<10} {'venue mid':>15} {'binance':>15} {'basis':>11}")
+            for pair in sorted(report.rows):
+                row = report.rows[pair]
+                ref = "n/a" if row.reference_price is None else f"{row.reference_price:,.6f}"
+                pct = "unverified" if row.basis_pct is None else f"{row.basis_pct * 100:+.3f}%"
+                print(f"    {pair:<10} {row.venue_mid:>15,.6f} {ref:>15} {pct:>11}")
+            if report.blocked():
+                print(f"    OVER TOLERANCE: {sorted(report.blocked())}")
+                problems.append(
+                    f"basis wider than {report.threshold_pct * 100:.2f}% on {sorted(report.blocked())}: "
+                    "check the symbol mapping (USDT vs USD) and feed freshness before trading"
+                )
+            if report.unverified:
+                print(f"    no reference price for {sorted(report.unverified)} (not blocked)")
+        else:
+            print(f"\nbasis vs Binance  WARN {report.error}")
+            print("    trading is still possible, but the venue-tracks-Binance premise is unverified")
+    except Exception as exc:
+        print(f"\nbasis vs Binance  WARN {exc}")
 
     try:
         balances = client.balance()

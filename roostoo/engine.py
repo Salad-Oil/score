@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from .basis import BasisMonitor
 from .candles import Candle, CandleBuilder, bar_index, load_candles, trading_day_id
 from .client import build_client
 from .config import Config
@@ -52,7 +53,12 @@ log = logging.getLogger(__name__)
 
 #: If the seeded history's last close is further than this from the live venue's
 #: price, the two feeds disagree and the seeded bars would poison every z-score.
-SEED_TOLERANCE_PCT = 0.02
+#:
+#: The organisers confirmed the venue tracks Binance, so a gap this large is not
+#: "a different but related market" -- it is a wrong symbol, a wrong quote
+#: currency, or a stale feed. Kept deliberately tight for that reason; the
+#: previous 2% allowance would have let a genuine USDT/USD mismatch through.
+SEED_TOLERANCE_PCT = 0.005
 
 
 @dataclass
@@ -326,6 +332,26 @@ class TradingEngine:
             candidates = {p: t for p, t in self.tickers.items() if p in configured}
         else:
             candidates = dict(self.tickers)
+
+        # Cross-venue basis check (once per bar, one HTTP call for the universe).
+        # The organisers confirmed the venue tracks Binance, so a wide basis is not
+        # "a related but different market" -- it is the wrong symbol, the wrong
+        # quote currency, or a stale feed, and a z-score computed against it is
+        # noise. This fails open by design: a Binance outage must not stop the bot
+        # from trading its own sampled bars, but the readings are journalled so a
+        # drift shows up as a time series rather than a silent assumption.
+        #
+        # Skipped against the simulator, whose prices are synthetic by
+        # construction: comparing them with Binance would block every pair.
+        if not self.cfg.mock:
+            basis_report = BasisMonitor(timeout=self.cfg.request_timeout_sec).check(candidates)
+            self.journal.event("basis", ts_ms=now_ms, **basis_report.to_dict())
+            blocked = basis_report.blocked()
+            if blocked:
+                log.warning("basis out of tolerance on %s; excluding them for this bar", sorted(blocked))
+                candidates = {p: t for p, t in candidates.items() if p not in blocked}
+            elif not basis_report.source_ok:
+                log.warning("basis check unavailable (%s); proceeding on venue data alone", basis_report.error)
 
         selection = self.selector.select(
             candidates,

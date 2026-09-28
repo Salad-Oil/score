@@ -38,18 +38,33 @@ That is a **snapshot**. It is not enough for the team's playbook:
 |---|---|---|
 | 30-minute OHLCV candles (Rules 2–6) | nothing | `CandleBuilder` samples the ticker into 30-min bars live; `scripts/fetch_history.py` pulls real history from Binance for backtests |
 | Per-bar volume (supp. Rules 3–4) | rolling 24h turnover only | live: the *change* in `UnitTradeValue` between samples; backtest: real Binance volume |
-| Order-book depth within ±0.5% (Rule 1) | **no endpoint** | pluggable `DepthProvider` — off in backtest, Binance L2 as a live proxy, or a Roostoo path the moment the organisers confirm one |
+| Order-book depth within ±0.5% (Rule 1) | **no endpoint** | pluggable `DepthProvider` — Binance L2 is now a legitimate proxy, since the venue is confirmed to track Binance |
 | ADX / ATR / VWAP / VolExpansion | nothing | computed from the bars above, pure Python, no numpy |
 
 The organisers' own **Data Sources Pack** recommends Binance Vision for bulk
 history and notes CoinAPI as the only listed source with real L2 depth. Binance
-klines are used here because they need no account or key.
+is used here because it needs no account or key.
 
-**The caveat that matters:** orders fill on Roostoo while signals may be computed
-from Binance data. Those are different books. The bot therefore refuses to seed
-its indicators from a CSV whose last close is more than 2% away from the venue's
-live mid (`engine.seed_history`) and journals the decision either way. Check the
-basis per pair before trusting an external feed.
+**The organisers confirmed the mock venue's prices follow Binance.** That single
+fact is what makes this whole design valid, and it is now *measured* rather than
+assumed. `roostoo/basis.py` compares every quoted pair against Binance on each
+bar, journals the readings, and excludes any pair whose basis exceeds
+`BASIS_MAX_PCT` (default 1%). A wide basis is not "a related but different
+market" — it is the wrong symbol (USDT vs USD), the wrong pair, or a stale feed,
+and fading a z-score computed against it is trading noise.
+
+Two consequences worth stating plainly:
+
+* **Rule 1's depth clause is now testable**, with one caveat: Binance's book
+  measures *market* liquidity, not the mock venue's own depth. It answers "is this
+  asset liquid", not "can Roostoo absorb my order". `DEPTH_PROVIDER=none` ships by
+  default because the check **fails closed** — if Binance's depth endpoint is
+  unreachable, every pair is excluded and the bot silently stops trading, which is
+  a bad failure mode inside a scored window that requires 8 active trading days.
+  Flip it to `binance` after `run_live.py --check` confirms connectivity.
+* **Bar alignment is exact.** Binance 30-minute candles close on the UTC :00/:30
+  grid and `CandleBuilder` floors samples to that same epoch-aligned grid, so a
+  live sampled bar and its Binance counterpart describe the same window.
 
 ## 2. Layout
 
@@ -64,6 +79,7 @@ roostoo/
   client.py       signed REST (HMAC-SHA256), retries, throttle, server-time sync
   simulator.py    in-process mock exchange: same surface, same fees, offline
   candles.py      OHLCV bars; live bar building and CSV loading
+  basis.py        cross-venue basis monitor (the venue is confirmed to track Binance)
   indicators.py   SMA/EMA/RSI/z-score + Wilder ADX, ATR, VWAP, VolExpansion, ReturnShock
   metrics.py      Sharpe / Sortino / Calmar / drawdown + the competition composite
   universe.py     Rule 1: turnover ranking, spread ceiling, depth provider
@@ -72,7 +88,7 @@ roostoo/
   engine.py       the autonomous decision loop
   journal.py      append-only audit trail (JSONL + trades.csv)
   backtest.py     event-driven backtester sharing the live objects
-tests/            334 unittest cases, stdlib only
+tests/            356 unittest cases, stdlib only
 ```
 
 ## 3. Rule map and ownership

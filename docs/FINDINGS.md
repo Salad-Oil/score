@@ -178,3 +178,11 @@ is how many trades get killed before they get there.
 * **The sweep's `OOS/IS ratio` flag is suppressed when |IS composite| < 0.5**, so
   it will print `n/a` for near-zero baselines instead of reporting a meaningless
   ratio like "10.34, ok".
+* **The venue tracks Binance — confirmed by the organisers.** That is the premise
+  that makes Binance-derived signals valid here, and it is now measured rather than
+  assumed: `roostoo/basis.py` compares every quoted pair against Binance each bar,
+  journals the readings, and excludes any pair beyond `BASIS_MAX_PCT` (default 1%).
+  The seeded-history tolerance in `engine.seed_history` was tightened from 2% to
+  0.5% for the same reason — a gap that large is a wrong symbol (USDT vs USD) or a
+  stale feed, not a related market. Note this check **fails open** (a Binance
+  outage must not stop trading), unlike the depth check, which fails closed.

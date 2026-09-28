@@ -23,9 +23,14 @@ window) about three things this repo cannot answer:
   the `available_sub` socket.io block is commented out), because Rule 1's
   "depth within ±0.5% > $X" depends on it;
 * whether **short positions** are enabled for the competition (the v6 endpoints
-  document an error string `this competition does not allow short positions`);
-* whether the mock venue's prices **track a real exchange**, and if so which one —
-  it decides whether Binance-derived signals transfer.
+  document an error string `this competition does not allow short positions`).
+
+**Already answered:** the mock venue's prices **track Binance**. That is why
+Binance klines are valid research data here and why Binance's L2 book can stand in
+for the missing depth endpoint — with the caveat that it measures market
+liquidity, not the venue's own book. `python3 run_live.py --check` verifies the
+basis per pair on the day; a reading beyond ~0.1% means the symbol mapping or feed
+freshness needs investigating before the bot trades on it.
 
 ## 1. Launch
 
