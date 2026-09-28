@@ -1,0 +1,37 @@
+[Unit]
+Description=Roostoo quant trading bot (HK vs AU vs IN Quant Trading Hackathon)
+Documentation=file:/opt/roostoo-quant-bot/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/roostoo-quant-bot
+Environment=PYTHONUNBUFFERED=1
+# The bot reads its credentials from .env (mode 600, git-ignored).
+ExecStart=/usr/bin/python3 /opt/roostoo-quant-bot/run_live.py --env /opt/roostoo-quant-bot/.env
+
+# A 14-day unattended run on a spot instance: always come back.
+Restart=always
+RestartSec=15
+# Give the shutdown handler time to persist state. NOTE: do NOT add
+# --flatten-on-exit here -- a crash-loop would then liquidate the book every time
+# the unit restarts. Flatten only in a deliberate, attended stop.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+# Journald keeps the console log; StructuredLogging is not needed.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=roostoo-bot
+
+# Contain a runaway bot: it is a 60-second loop, not a compute job.
+MemoryMax=512M
+CPUQuota=50%
+# Never let two instances trade the same account at once.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,126 @@
+# Deploying on the AWS EC2 instance Roostoo provides
+
+The rulebook: *"Each team will be provided with an AWS sub-account to launch an
+EC2 instance for hosting your bot... You are required to deploy your bot on an
+AWS VM and ensure it executes trades automatically."*
+
+## What the Oct 1 email is likely to contain
+
+The organisers said teams get an **AWS sub-account** and that the competition runs
+"on AWS cloud infrastructure (provisioned by Roostoo)". The Luma page links an
+official *"Hackathon Guide: How to Sign In AWS and Launch Your Bot"*, so expect:
+
+1. AWS sub-account credentials (account id / IAM user / console sign-in URL).
+2. EC2 guidance — region, instance type, and whether they bill your sub-account.
+3. **The Roostoo `API_KEY` / `SECRET_KEY`.** Without these nothing can trade; the
+   docs say keys are issued by request to `jolly@roostoo.com`.
+4. Possibly the `mock-api.roostoo.com` allow-list requirements.
+
+**Ask in the WhatsApp group during the Sep 18 workshop** (or the Oct 1 prep
+window) about three things this repo cannot answer:
+
+* whether an **order-book depth endpoint** exists (the public docs have none —
+  the `available_sub` socket.io block is commented out), because Rule 1's
+  "depth within ±0.5% > $X" depends on it;
+* whether **short positions** are enabled for the competition (the v6 endpoints
+  document an error string `this competition does not allow short positions`);
+* whether the mock venue's prices **track a real exchange**, and if so which one —
+  it decides whether Binance-derived signals transfer.
+
+## 1. Launch
+
+Ubuntu 22.04/24.04 LTS, `t3.small` is ample (the bot is a 60-second loop).
+Open **no inbound ports**: the bot is outbound-only. Keep the security group
+default-deny.
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3 chrony
+sudo timedatectl set-timezone Asia/Hong_Kong    # Rule 11's trading day is UTC+8
+```
+
+### Clock accuracy is not optional
+
+Every signed request carries a millisecond timestamp and the exchange rejects
+anything more than **60 seconds** away from its own clock:
+
+```javascript
+if (abs(serverTime - timestamp) <= 60*1000) { /* process */ } else { /* reject */ }
+```
+
+```bash
+sudo systemctl enable --now chrony
+chronyc tracking | head -4
+python3 run_live.py --check      # prints the measured offset
+```
+
+The client also measures the offset at startup and applies it, so a small skew is
+survivable — a large one is not.
+
+## 2. Install
+
+```bash
+sudo mkdir -p /opt/roostoo-quant-bot && sudo chown "$USER" /opt/roostoo-quant-bot
+git clone <your-fork-url> /opt/roostoo-quant-bot
+cd /opt/roostoo-quant-bot
+
+cp .env.example .env && chmod 600 .env
+nano .env        # ROOSTOO_API_KEY, ROOSTOO_SECRET_KEY, ROOSTOO_PAIRS, DEPTH_PROVIDER
+```
+
+Credentials live **only** in `.env`, which is git-ignored. Never commit them, and
+never paste them into a notebook or an LLM prompt.
+
+Seed the indicators so trading can start immediately instead of after 48 bars:
+
+```bash
+python3 scripts/fetch_history.py --days 30 --symbols BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT
+```
+
+## 3. Verify before arming
+
+```bash
+python3 run_live.py --check          # read-only: clock, exchangeInfo, ticker, balance, shorts
+python3 run_live.py --mock --cycles 20   # proves the loop end-to-end
+python3 run_live.py --cycles 3           # three real cycles against the venue
+```
+
+`--check` sends **no orders**, which matters: the rules forbid manual API calls
+that trade, and any doubt about whether a bot "called the API by hand" is a
+disqualification risk under *Commit History Transparency*.
+
+## 4. Run it supervised
+
+```bash
+sudo cp deploy/roostoo-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now roostoo-bot
+systemctl status roostoo-bot
+journalctl -u roostoo-bot -f
+```
+
+The unit restarts on failure (`Restart=always`) and keeps the loop alive for 14
+days. It does **not** pass `--flatten-on-exit` on purpose: with an auto-restart, a
+crash-loop would liquidate the book on every restart.
+
+## 5. Operating during the competition
+
+```bash
+tail -f logs/bot.log                         # human-readable
+ls journal/                                  # decisions-YYYYMMDD.jsonl, trades-YYYYMMDD.csv
+python3 -c "from roostoo.journal import read_events; print(len(read_events('journal/decisions-YYYYMMDD.jsonl')))"
+```
+
+* **Rule compliance** wants at least 8 active trading days with trades each day.
+  Watch the `cycle`/`trade` counts in the journal rather than the leaderboard; a
+  stalled bot looks identical to a flat one from the outside.
+* **To iterate a strategy**, commit the change, redeploy, then restart. The
+  position book and risk state are restored from `journal/`, so a restart does not
+  lose stops or cooldowns.
+* **Emergency stop that keeps positions:** `sudo systemctl stop roostoo-bot`.
+* **Emergency stop that closes the book:** `python3 run_live.py --flatten-on-exit --cycles 1`.
+
+## 6. Cost control
+
+The instance runs for the full window; stop it when the competition ends
+(`sudo shutdown -h now`) unless the team continues on the sponsored
+infrastructure. Set a CloudWatch billing alarm on the sub-account's budget.

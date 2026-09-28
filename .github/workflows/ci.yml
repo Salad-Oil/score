@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The bot targets a bare Python on EC2; keep the floor honest.
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No third-party runtime dependency exists on purpose, so there is nothing
+      # to install before the unit tests.
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Byte-compile every module
+        run: python -m compileall -q roostoo run_live.py run_backtest.py run_sweep.py scripts
+
+      - name: Configuration rejects a missing key
+        run: |
+          if python -c "from roostoo.config import Config; Config.from_env({})"; then
+            echo "expected Config.from_env({}) to fail without credentials"; exit 1
+          fi
+
+      - name: Mock loop runs end to end
+        run: python run_live.py --mock --cycles 2 --loop-interval 5 --no-seed --log-level WARNING
+
+      - name: Backtest runs on the committed sample data
+        run: python run_backtest.py --data-dir data --pairs ETH/USD --quiet
