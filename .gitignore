@@ -1,0 +1,27 @@
+# Secrets -- NEVER commit
+.env
+*.pem
+keys.json
+credentials.json
+
+# Runtime artefacts (regenerated every run; keep out of git)
+logs/
+journal/
+state/
+data/*.csv
+!data/sample_*.csv
+# Backtest artefacts are regenerated; the grid definitions are configuration.
+reports/*.csv
+reports/*.json
+!reports/grid_*.json
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.DS_Store

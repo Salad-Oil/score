@@ -1,0 +1,6 @@
+# The bot core is deliberately dependency-free: Python 3.9+ standard library
+# only. That keeps the AWS EC2 deploy trivial and removes supply-chain risk
+# during a 14-day unattended run. `requests` is NOT required.
+
+# Optional extras for research / CI only:
+#   pip install -r requirements-dev.txt
