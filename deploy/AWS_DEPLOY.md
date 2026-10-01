@@ -40,8 +40,14 @@ default-deny.
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3 chrony
-sudo timedatectl set-timezone Asia/Hong_Kong    # Rule 11's trading day is UTC+8
+sudo timedatectl set-timezone Asia/Hong_Kong
 ```
+
+The timezone is only there so your own `date`/`journalctl` output reads in the
+trading day. It does **not** affect Rule 11: the day boundary comes from
+`TRADING_DAY_OFFSET_HOURS` (a fixed UTC+8 offset applied to the millisecond
+timestamp), so the bot computes the same boundary whatever the host clock is set
+to.
 
 ### Clock accuracy is not optional
 
@@ -122,7 +128,15 @@ python3 -c "from roostoo.journal import read_events; print(len(read_events('jour
   position book and risk state are restored from `journal/`, so a restart does not
   lose stops or cooldowns.
 * **Emergency stop that keeps positions:** `sudo systemctl stop roostoo-bot`.
-* **Emergency stop that closes the book:** `python3 run_live.py --flatten-on-exit --cycles 1`.
+* **Emergency stop that closes the book:** stop the service FIRST, then flatten.
+  Running it while the unit is up leaves two writers on the same account and the
+  same `journal/*.tmp` files. Also note that `--cycles 1` still runs one full
+  decision cycle, so it can open a new position and flatten it immediately,
+  paying both spreads -- to just close the book, use the venue's own UI.
+  ```bash
+  sudo systemctl stop roostoo-bot
+  cd /opt/roostoo-quant-bot && python3 run_live.py --flatten-on-exit --cycles 1
+  ```
 
 ## 6. Cost control
 

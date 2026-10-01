@@ -88,8 +88,15 @@ roostoo/
   engine.py       the autonomous decision loop
   journal.py      append-only audit trail (JSONL + trades.csv)
   backtest.py     event-driven backtester sharing the live objects
-tests/            356 unittest cases, stdlib only
+tests/            375 unittest cases, stdlib only
+scripts/          secret scanning, history fetch, sweep analysis
+docs/SECURITY.md  how credentials are handled, and what to do if one leaks
 ```
+
+**Never commit a key.** `.env` is git-ignored and is the only place credentials
+live; `.env.example` is committed with empty values. Three guards enforce that --
+a pre-commit hook, `scripts/publish.ps1` and a `secret-scan` CI job -- all
+described in [docs/SECURITY.md](docs/SECURITY.md).
 
 ## 3. Rule map and ownership
 
@@ -175,11 +182,20 @@ frequency is a first-order parameter.
   Stops are detected against the bar's high/low and filled at the stop level.
 * **In-flight orders reserve capital.** Two consecutive bars must not each size a
   full position for the same pair. `RiskManager.evaluate` takes
-  `committed_pairs`/`committed_notional` for exactly this; the bug is covered by
-  a regression test.
-* **State survives restart.** `PositionBook` and the risk state persist to
-  `journal/`, and every cycle reconciles local quantities against the exchange
-  balances, which are authoritative.
+  `committed_pairs`/`committed_notional` for exactly this, and Rule 9 is tested
+  against the *projected* book so an exit approved earlier in the same batch frees
+  its capital for a later entry. Both are covered by regression tests.
+* **State survives restart, and a failed start is non-destructive.** `PositionBook`
+  and the risk state persist to `journal/`, and every cycle reconciles local
+  quantities against the exchange balances, which are authoritative. State is
+  loaded *before* any network call, an empty book may not overwrite a real one,
+  and nothing is persisted until bootstrap has completed -- so a transient failure
+  during startup can no longer erase stops, cost basis, cooldowns or the kill
+  switch.
+* **A partial balance snapshot is not acted on.** If the venue's response has no
+  quote-currency row the cycle is skipped and journalled, rather than pricing the
+  book at zero (which would trip the permanent kill switch) and reconciling every
+  missing row as a closed position.
 * **Depth fails closed.** If a depth provider is configured and returns nothing,
   the pair is excluded rather than assumed liquid.
 
@@ -203,12 +219,14 @@ guide.
 ## 7. Tests
 
 ```bash
-python -m unittest discover -s tests -t .     # 334 tests, no network, no sleeping
+python -m unittest discover -s tests -t .     # 375 tests, no network, no sleeping
 ```
 
 Includes the HMAC signature reproduced byte-for-byte from Roostoo's published
 test vector — the failure mode that would otherwise cost a day of the
-competition to diagnose on live keys.
+competition to diagnose on live keys — and `tests/test_state_safety.py`, which
+pins the guarantees that a bad startup or a malformed balance response cannot
+destroy the stored book.
 
 ## 8. 中文快速开始
 

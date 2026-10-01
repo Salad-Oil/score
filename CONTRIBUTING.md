@@ -98,9 +98,12 @@ git push -u origin rule5-atr-stop     # then open a Pull Request
 * **Never commit `.env`.** It is git-ignored; keys live only on the machine that
   runs the bot. If a key is ever committed, rotate it — deleting the commit is
   not enough.
-* **CI must pass.** `.github/workflows/ci.yml` runs the 334 unit tests on
-  Python 3.10 and 3.13, byte-compiles everything, and runs the simulator loop
-  and a sample backtest. A red PR does not get merged.
+* **CI must pass.** `.github/workflows/ci.yml` runs the 375 unit tests on
+  Python 3.10 and 3.13, byte-compiles everything (which is what catches a file
+  that does not even parse), and runs the simulator loop and a sample backtest.
+  A separate `secret-scan` job scans the history for credentials. The required
+  status check is the single job named `ci`, which gates the whole matrix. A red
+  PR does not get merged.
 * **Small, labelled commits.** The competition screens for *Commit History
   Transparency*: the history should show the strategy evolving, and should make
   clear that every trade came from the bot, not from a hand-called API. Keep the
