@@ -1,0 +1,31 @@
+# gitleaks configuration.
+#
+# `useDefault = true` keeps the stock rule set -- AWS keys, private-key blocks,
+# generic `api_key = "..."` / `secret = "..."` assignments and so on. On top of
+# that there is exactly one allowlist entry, for the *published* Roostoo example
+# vector that the test suite deliberately pins.
+#
+# Nothing else is allowlisted. In particular the real leak that is still in this
+# repository's history is NOT suppressed: a red `secret-scan` job is the
+# intended reminder until docs/SECURITY.md's purge has been run.
+
+title = "roostoo-quant-bot"
+
+[extend]
+useDefault = true
+
+# NOTE: `[allowlist]` (singular) is the form supported across gitleaks v8.0
+# through current; v8.19+ also accepts `[[allowlists]]` (plural) and deprecates
+# this one. Singular is used deliberately so the job does not depend on which
+# gitleaks release gitleaks-action happens to download. If a future release ever
+# rejects it, change `[allowlist]` to `[[allowlists]]` -- nothing else moves.
+[allowlist]
+  description = "Published Roostoo API docs example vector (not a live credential)"
+  # tests/test_signing.py:24 pins HMAC-SHA256 against the example secret printed
+  # in Roostoo's public API documentation, whose canonical string carries
+  # timestamp=1580774512000 (Feb 2020) and whose expected signature is published
+  # alongside it. It is committed on purpose: without it the signature test would
+  # be comparing against nothing. It has never been able to sign a real request.
+  regexes = [
+    '''S1XP1e3UZj6A7H5fATj0jNhqPxxdSJYdInClVN65XAbvqqMKjVHjA7PZj4W12oep''',
+  ]

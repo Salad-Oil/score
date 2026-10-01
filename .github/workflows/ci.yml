@@ -22,8 +22,11 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -t . -v
 
+      # This is the step that catches a file that does not even parse. It is
+      # deliberately a separate step from the tests: a syntax error in a module
+      # no test imports would otherwise slip through.
       - name: Byte-compile every module
-        run: python -m compileall -q roostoo run_live.py run_backtest.py run_sweep.py scripts
+        run: python -m compileall -q roostoo tests run_live.py run_backtest.py run_sweep.py scripts
 
       - name: Configuration rejects a missing key
         run: |
@@ -36,3 +39,43 @@ jobs:
 
       - name: Backtest runs on the committed sample data
         run: python run_backtest.py --data-dir data --pairs ETH/USD --quiet
+
+  secrets:
+    # Scans the full history, so it is RED until the known-leaked test key is
+    # purged (see docs/SECURITY.md). That is intentional: it is the reminder.
+    # It is deliberately NOT part of the required `ci` check, so it cannot block
+    # an unrelated merge; add it to the ruleset's required checks once the purge
+    # is done.
+    name: secret-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the whole point is scanning history, not the tip
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+
+  ci:
+    # A single, stable check name. The branch ruleset requires a status check
+    # called exactly `ci`, but a matrix job reports as `test (3.10)` and
+    # `test (3.13)`, so requiring `ci` would never be satisfied and every PR
+    # would hang on "Expected -- waiting for status to be reported". This gate
+    # collapses the matrix into one result under the name the ruleset wants.
+    name: ci
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless the test matrix succeeded
+        run: |
+          result="${{ needs.test.result }}"
+          echo "test matrix result: $result"
+          if [ "$result" != "success" ]; then
+            echo "::error::the test matrix did not succeed ($result)"
+            exit 1
+          fi

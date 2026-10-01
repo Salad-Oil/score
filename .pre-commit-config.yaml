@@ -1,0 +1,32 @@
+# Local guard rails. Install once with:
+#
+#     pip install pre-commit
+#     pre-commit install
+#
+# Both hooks are `repo: local`, so nothing is downloaded and there is no external
+# revision to keep in sync. They call this repository's own tools, which is also
+# why they still work on an offline EC2 box. CI runs the same checks
+# independently (.github/workflows/ci.yml) plus gitleaks as a second opinion.
+repos:
+  - repo: local
+    hooks:
+      - id: scan-secrets
+        name: scan the index for credentials
+        entry: python scripts/scan_secrets.py --staged
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: compile-all
+        name: byte-compile every module
+        entry: python -m compileall -q roostoo tests run_live.py run_backtest.py run_sweep.py scripts
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: unit-tests
+        name: unit tests
+        entry: python -m unittest discover -s tests -t .
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -40,7 +40,9 @@ function Fail($message) {
 Write-Host "Publishing $repoRoot" -ForegroundColor Cyan
 
 # --- 1. Never publish a secret -------------------------------------------------
-Write-Host "[1/5] scanning tracked files for secrets..."
+Write-Host "[1/5] scanning for secrets (filenames, contents and history)..."
+
+# 1a. Filenames that must never be tracked at all.
 $tracked = git ls-files
 if (-not $tracked) { Fail "nothing is tracked by git yet." }
 
@@ -56,7 +58,27 @@ refusing to publish. Remove them from the index (the file stays on disk):
 then rotate the key, because it is already in your local history.
 "@
 }
-Write-Host "      no secret-looking files tracked" -ForegroundColor Green
+
+# 1b. CONTENTS, in the index, the worktree and every commit reachable from any
+#     ref. Step 1a alone is what this script used to do, and that is exactly how
+#     a hardcoded API key and secret inside a .py file were published to a public
+#     repository: the filename looked innocuous, so nothing ever read the bytes.
+$python = $null
+foreach ($candidate in @('python', 'python3', 'py')) {
+    if (Get-Command $candidate -ErrorAction SilentlyContinue) { $python = $candidate; break }
+}
+if (-not $python) {
+    Fail "no python on PATH. The content/history secret scan needs it; run 'python scripts/scan_secrets.py --all' yourself before publishing."
+}
+& $python 'scripts/scan_secrets.py' '--all'
+if ($LASTEXITCODE -ne 0) {
+    Fail @"
+refusing to publish: the secret scan found credentials (output above).
+Rotate the key with the issuer FIRST -- deleting the commit does not unpublish
+it -- then remove it from history. See docs/SECURITY.md.
+"@
+}
+Write-Host "      no secrets in filenames, contents or history" -ForegroundColor Green
 
 # --- 2. Sanity-check the local repository -------------------------------------
 Write-Host "[2/5] checking local repository..."
