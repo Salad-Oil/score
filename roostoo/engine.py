@@ -118,12 +118,25 @@ class TradingEngine:
         self._seed_paths: dict[str, str | Path] = dict(seed_paths or {})
         self._pending_by_pair: dict[str, int] = {}
         self._shutting_down = False
+        #: Gate for ``_persist()``. Stays False until ``bootstrap()`` has
+        #: completed, so a startup failure can never overwrite stored state.
+        self._ready = False
 
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
     def bootstrap(self) -> None:
         """Sync the clock, learn the venue's rules, restore state, warm up."""
+        # Restore persisted state FIRST, before anything that can fail on the
+        # network. `run_live.py` always calls `shutdown()` from a `finally:`,
+        # and `shutdown()` persists; if `sync_time()` or `exchange_info()` threw
+        # before the book had been loaded, that persist would write a
+        # default-empty book and default risk state over the real ones -- losing
+        # every stop level, cost basis and cooldown, resetting the drawdown
+        # high-water mark, and silently clearing the kill switch.
+        self.book.load()
+        self._load_risk_state()
+
         offset = self.client.sync_time()
         info = self.client.exchange_info()
         self.exchange_pairs = {p: tp for p, tp in info.pairs.items() if tp.can_trade}
@@ -134,8 +147,6 @@ class TradingEngine:
         self.universe = [p for p in configured if p in self.exchange_pairs] if configured else []
         if configured and not self.universe:
             log.warning("none of the configured pairs are tradable; falling back to auto-discovery")
-        self.book.load()
-        self._load_risk_state()
 
         self.journal.startup(
             self.cfg.redacted(),
@@ -153,6 +164,7 @@ class TradingEngine:
             len(self.book.positions),
             offset,
         )
+        self._ready = True
 
     def seed_history(self) -> None:
         """Warm the indicators from CSV, but only if the feed agrees on price.
@@ -221,6 +233,24 @@ class TradingEngine:
         tickers = self.client.ticker()
         self.tickers = tickers
         balances = self.client.balance()
+
+        # A partial or malformed balance snapshot must never be acted on. With no
+        # USD row the portfolio cannot be priced: NAV collapses to the marks of
+        # the positions alone, which reads as a catastrophic drawdown and trips
+        # the *permanent* kill switch. The same payload would also make
+        # reconciliation read every missing row as "the exchange holds nothing"
+        # and delete the entire book. Skipping one cycle is cheap; acting on a
+        # bad response liquidates the account's memory.
+        if not self._balances_usable(balances):
+            log.error("balance payload has no USD row (assets=%s); skipping this cycle", sorted(balances))
+            self.journal.error(
+                "cycle",
+                "balance payload has no USD row; skipping rather than acting on an incomplete snapshot",
+                ts_ms=now_ms,
+                assets=sorted(balances),
+            )
+            return
+
         self.balances = balances
         shorts = self._safe_short_positions()
 
@@ -667,6 +697,16 @@ class TradingEngine:
         return rounded
 
     @staticmethod
+    def _balances_usable(balances: dict[str, WalletBalance]) -> bool:
+        """Is this snapshot complete enough to price the book and reconcile it?
+
+        The quote currency must be present. An absent ``USD`` row means either a
+        partial response or a venue that renamed its quote asset; either way the
+        numbers derived from it are fiction, so the cycle is skipped.
+        """
+        return "USD" in balances
+
+    @staticmethod
     def _cash_usd(balances: dict[str, WalletBalance]) -> float:
         usd = balances.get("USD")
         return usd.total if usd else 0.0
@@ -696,6 +736,15 @@ class TradingEngine:
 
     def _persist(self) -> None:
         import json
+
+        if not self._ready:
+            # Bootstrap never completed, so the in-memory book and risk state are
+            # whatever the constructors left behind -- empty and default. Writing
+            # them would destroy the real files on disk. `shutdown()` persists
+            # from a `finally:`, so this guard is what makes a failed startup
+            # non-destructive.
+            log.error("not persisting state: bootstrap has not completed (a startup failure must not overwrite the stored book)")
+            return
 
         self.book.save()
         try:
