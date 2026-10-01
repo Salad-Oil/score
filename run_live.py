@@ -27,7 +27,7 @@ from roostoo.basis import BasisMonitor  # noqa: E402
 from roostoo.client import build_client  # noqa: E402
 from roostoo.engine import TradingEngine  # noqa: E402
 from roostoo.journal import Journal  # noqa: E402
-from roostoo.strategies.base import load_strategy  # noqa: E402
+from roostoo.universe import build_depth_provider  # noqa: E402
 
 log = logging.getLogger("run_live")
 
@@ -49,7 +49,12 @@ def run_check(cfg) -> int:
         offset = client.sync_time()
         print(f"server time      OK   clock offset {offset:+d} ms")
         if abs(offset) > 30_000:
-            problems.append(f"host clock is {offset} ms from the exchange (limit is 60 s)")
+            # Warn at half the limit: the client applies the offset, but a host
+            # clock that far out is a symptom worth fixing before it drifts more.
+            problems.append(
+                f"host clock is {offset} ms from the exchange; the venue rejects "
+                "signed requests beyond 60 s, and this is already half of that"
+            )
     except Exception as exc:
         print(f"server time      FAIL {exc}")
         return 1
@@ -71,6 +76,7 @@ def run_check(cfg) -> int:
         print(f"exchange info    FAIL {exc}")
         return 1
 
+    tickers: dict = {}
     try:
         tickers = client.ticker()
         print(f"\ntickers          OK   {len(tickers)} pairs quoted")
@@ -115,6 +121,40 @@ def run_check(cfg) -> int:
             print("    trading is still possible, but the venue-tracks-Binance premise is unverified")
     except Exception as exc:
         print(f"\nbasis vs Binance  WARN {exc}")
+
+    # Rule 1's depth clause is pluggable and its failure mode depends on the
+    # provider: `binance` FAILS CLOSED, so an unreachable depth endpoint excludes
+    # every pair and the bot silently stops trading -- the worst possible thing
+    # to discover during a scored window. README and AWS_DEPLOY both tell the
+    # operator to confirm depth connectivity with `--check`, so actually exercise
+    # the configured provider here instead of leaving that claim unbacked.
+    if cfg.depth_provider != "none" and tickers:
+        try:
+            provider = build_depth_provider(cfg, tickers, client)
+            probes = sorted(tickers.values(), key=lambda t: t.unit_volume, reverse=True)[: cfg.max_pairs]
+            print(f"\ndepth ({provider.name})   OK   probing {len(probes)} pair(s), target ${cfg.depth_target_notional:,.0f}")
+            usable = 0
+            for ticker in probes:
+                snapshot = provider.snapshot(ticker.pair, cfg.depth_band_pct)
+                if snapshot is None:
+                    print(f"    {ticker.pair:<10} unavailable")
+                    continue
+                available = snapshot.for_side("BUY")
+                flag = "ok" if available >= cfg.depth_target_notional else "below target"
+                print(f"    {ticker.pair:<10} ask-side within +/-{cfg.depth_band_pct * 100:.2f}%: {available:>14,.0f}  {flag}")
+                if available >= cfg.depth_target_notional:
+                    usable += 1
+            if usable == 0:
+                problems.append(
+                    f"depth provider '{provider.name}' returned nothing usable for any probed pair. "
+                    "It fails CLOSED, so with this setting Rule 1 rejects every pair and the bot will "
+                    "not trade at all. Use DEPTH_PROVIDER=none until this check passes."
+                )
+        except Exception as exc:
+            print(f"\ndepth            WARN {exc}")
+            problems.append(f"depth provider '{cfg.depth_provider}' raised: {exc}")
+    elif cfg.depth_provider == "none":
+        print("\ndepth            SKIP DEPTH_PROVIDER=none (Rule 1 clause 3 is not enforced)")
 
     try:
         balances = client.balance()
@@ -229,11 +269,8 @@ def main(argv: list[str] | None = None) -> int:
     log.info("strategy: %s", engine.strategy.describe())
     log.info("mode: %s, loop=%ss, bar=%ss", "MOCK" if cfg.mock else "LIVE", cfg.loop_interval_sec, cfg.bar_seconds)
 
-    stopping = {"flag": False}
-
     def handle_signal(signum, _frame):
         log.warning("received signal %s; shutting down%s", signum, " and flattening" if args.flatten_on_exit else "")
-        stopping["flag"] = True
         engine._shutting_down = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):

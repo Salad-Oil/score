@@ -212,13 +212,15 @@ class RoostooDepthProvider:
         self._warned = False
 
     def snapshot(self, pair: str, band_pct: float) -> Optional[DepthSnapshot]:
-        params = {"pair": pair}
-        if hasattr(self.client, "timestamp_ms"):
+        signer = getattr(self.client, "sign_headers", None)
+        params: dict[str, Any] = {"pair": pair}
+        if callable(signer) and hasattr(self.client, "timestamp_ms"):
             params["timestamp"] = self.client.timestamp_ms()
         query = "&".join(f"{k}={params[k]}" for k in sorted(params))
         headers = {"Accept": "application/json"}
-        if hasattr(self.client, "_sign_headers"):
-            headers.update(self.client._sign_headers(params))
+        if callable(signer):
+            # Sign the exact query string that goes on the wire.
+            headers.update(signer(params, canonical=query))
         url = f"{self.client.base_url}{self.path}?{query}"
         try:
             status, text = self._transport.send("GET", url, None, headers, self.timeout)
@@ -266,7 +268,11 @@ def _parse_book(payload: Any, pair: str, band_pct: float) -> Optional[DepthSnaps
             return None
 
     norm_bids = [x for x in (norm(b) for b in bids) if x is not None]
-    norm_asks = [x for x in (norm(a) for a in asks) if a is not None]
+    # `x`, not `a`: the inner generator's loop variable is not in scope in the
+    # outer condition, so `if a is not None` raised NameError for every payload
+    # that had an ask side -- i.e. always. This parser had therefore never once
+    # returned a snapshot.
+    norm_asks = [x for x in (norm(a) for a in asks) if x is not None]
     if not norm_bids or not norm_asks:
         return None
     mid = (norm_bids[0][0] + norm_asks[0][0]) / 2.0

@@ -171,6 +171,24 @@ class RoostooClient:
     def server_offset_ms(self) -> int:
         return self._server_offset_ms
 
+    def sign_headers(self, params: dict[str, Any], canonical: Optional[str] = None) -> dict[str, str]:
+        """The auth headers for ``params``.
+
+        Public rather than inlined in ``_call`` so that auxiliary signed
+        endpoints can reuse the exact same signing path. ``RoostooDepthProvider``
+        used to probe for a private ``_sign_headers`` that never existed, so it
+        silently sent *unsigned* requests to a credential-requiring path.
+
+        ``canonical`` lets the caller pass the very string it is about to put on
+        the wire, which removes any chance of signing one thing and sending
+        another.
+        """
+        body = canonical if canonical is not None else canonical_params(params)
+        return {
+            "RST-API-KEY": self.cfg.api_key,
+            "MSG-SIGNATURE": sign_payload(body, self.cfg.secret_key),
+        }
+
     # -- plumbing -------------------------------------------------------
     def _throttle(self) -> None:
         """Enforce a floor between requests.
@@ -200,8 +218,7 @@ class RoostooClient:
         if signed:
             params["timestamp"] = self.timestamp_ms()
             body_str = canonical_params(params)
-            headers["RST-API-KEY"] = self.cfg.api_key
-            headers["MSG-SIGNATURE"] = sign_payload(body_str, self.cfg.secret_key)
+            headers.update(self.sign_headers(params, canonical=body_str))
         else:
             body_str = None
 

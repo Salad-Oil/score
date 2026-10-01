@@ -4,6 +4,12 @@ Documentation=file:/opt/roostoo-quant-bot/README.md
 After=network-online.target
 Wants=network-online.target
 
+# Contain a crash loop. These are [Unit] directives on systemd >= 230; in
+# [Service] modern systemd logs "Unknown key name" and IGNORES them, which
+# silently left `Restart=always` with no rate limit at all.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
 [Service]
 Type=simple
 User=ubuntu
@@ -29,9 +35,6 @@ SyslogIdentifier=roostoo-bot
 # Contain a runaway bot: it is a 60-second loop, not a compute job.
 MemoryMax=512M
 CPUQuota=50%
-# Never let two instances trade the same account at once.
-StartLimitIntervalSec=300
-StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
