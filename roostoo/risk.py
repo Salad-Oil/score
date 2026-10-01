@@ -132,6 +132,9 @@ class PositionBook:
     def __init__(self, path: Optional[str | Path] = None) -> None:
         self.positions: dict[str, Position] = {}
         self.path = Path(path) if path else None
+        #: Set only by a *successful* ``load()``. See ``save()`` for why the
+        #: difference between "loaded and empty" and "never loaded" matters.
+        self._load_attempted = False
 
     # -- mutation --------------------------------------------------------
     def mark(self, tickers: dict[str, Ticker]) -> None:
@@ -221,8 +224,33 @@ class PositionBook:
             }
         }
 
+    def _existing_book_is_non_empty(self) -> bool:
+        """Is there a real book on disk that a default-constructed book would destroy?"""
+        try:
+            if not self.path or not self.path.is_file():
+                return False
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return bool((payload or {}).get("positions"))
+        except Exception:
+            # Unreadable or corrupt: treat it as non-empty so we never clobber it.
+            return True
+
     def save(self) -> None:
         if not self.path:
+            return
+        # Never let an empty in-memory book overwrite a real file on disk. The
+        # engine loads state at the very start of bootstrap(); if that never ran
+        # -- a network blip, an exception before load, a partial startup -- then
+        # this object is still empty *by default*, and writing it would silently
+        # erase every stop level, cost basis, cooldown and the drawdown
+        # high-water mark. A book whose positions were genuinely closed still
+        # writes an empty file, because that path goes through load() first.
+        if not self._load_attempted and self._existing_book_is_non_empty():
+            log.error(
+                "refusing to overwrite the non-empty position book at %s: it was never "
+                "loaded in this process, so the in-memory book is empty by default",
+                self.path,
+            )
             return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +283,7 @@ class PositionBook:
                 opened_ts_ms=int(row.get("opened_ts_ms", 0)),
             )
         log.info("restored %d position(s) from %s", len(self.positions), self.path)
+        self._load_attempted = True
         return True
 
 
@@ -622,9 +651,13 @@ class RiskManager:
         in_flight = {p for p in (committed_pairs or ())}
         committed = max(0.0, float(committed_notional))
         cooldown = self.cooldown_blocked(bar_idx)
-        gross_budget = view.nav * self.cfg.max_gross_exposure - view.gross_exposure - committed
+        gross_cap = view.nav * self.cfg.max_gross_exposure
         # Track projected exposure as approvals accumulate, so a bar that fires
-        # four entries cannot collectively overshoot Rule 9.
+        # four entries cannot collectively overshoot Rule 9. Rule 9 is tested
+        # against this projected figure rather than a budget computed once up
+        # front: an exit approved earlier in the same batch frees its capital,
+        # and a stale budget kept rejecting entries that now fit (the slot was
+        # freed by Rule 10 but the money was not freed by Rule 9).
         projected_gross = view.gross_exposure + committed
         projected_pairs = set(view.open_pairs()) | in_flight
 
@@ -667,7 +700,7 @@ class RiskManager:
             if len(projected_pairs) >= self.cfg.max_open_positions:
                 decision.rejected.append((pair, f"Rule 10: max {self.cfg.max_open_positions} positions"))
                 continue
-            if gross_budget <= 0:
+            if gross_cap - projected_gross <= 0:
                 decision.rejected.append((pair, f"Rule 9: gross exposure at {self.cfg.max_gross_exposure:.0%} NAV"))
                 continue
 
@@ -683,7 +716,7 @@ class RiskManager:
                 nav=view.nav,
                 price=price,
                 atr=atr if isinstance(atr, (int, float)) else None,
-                gross_budget_left=gross_budget,
+                gross_budget_left=gross_cap - projected_gross,
                 is_short=is_short,
             )
             if sizing.notional < self.cfg.min_order_notional:
@@ -708,7 +741,6 @@ class RiskManager:
             )
             projected_pairs.add(pair)
             projected_gross += sizing.notional
-            gross_budget = view.nav * self.cfg.max_gross_exposure - projected_gross
 
         if self.halted:
             decision.notes.append("kill switch active: flattening")
