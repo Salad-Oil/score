@@ -35,20 +35,30 @@ one.
 |---|---|---|
 | `scripts/scan_secrets.py --staged` | `.pre-commit-config.yaml` | a credential in the blob about to be committed |
 | `scripts/scan_secrets.py --all` | `scripts/publish.ps1` step 1 | a credential in filenames, contents **or history** |
-| gitleaks | `.github/workflows/ci.yml` (`secret-scan` job) | the same, with an independent rule set and entropy detection |
+| `scripts/scan_secrets.py --history` | CI `secret-scan` job, step 1 | the same, across every commit reachable from any ref |
+| gitleaks | CI `secret-scan` job, step 2 | an independent rule set with entropy detection, over the commits in that push/PR |
 
-The first two share one pattern list (`scripts/scan_secrets.py`), so there is a
+The first three share one pattern list (`scripts/scan_secrets.py`), so there is a
 single place to add a pattern. gitleaks is deliberately a *second, independent*
 implementation: if one has a blind spot, the other may not.
 
+The two CI steps are not redundant, and the difference matters. `gitleaks-action`
+scans only the commits in the triggering push or pull request, so it would have
+missed the key below entirely -- it was introduced many commits earlier, and the
+run that added this job reported **success** for exactly that reason. The
+full-history scan is what makes this job meaningful; it walks
+`git log --all` rather than a commit range.
+
 `secret-scan` is currently **not** part of the required `ci` check, because it
-scans history and history still contains a leaked key (see below). Add it to the
-required checks once the purge is done.
+scans history and history still contains a leaked key (see below), so it is red
+until the purge is done. Add it to the required checks afterwards.
 
 If a string is a *published example* rather than a credential, add the exact
 value to `ALLOWED_VALUES` in `scripts/scan_secrets.py` and the `[allowlist]`
 block in `.gitleaks.toml`, with a comment saying where it is published. Keep that
-list short; every entry is a place a real key could hide.
+list short; every entry is a place a real key could hide. Adding an entry is a
+deliberate, reviewable decision -- do not fix a red `secret-scan` by widening the
+allowlist.
 
 ## Incident: the test key committed on 2026-09-30
 
