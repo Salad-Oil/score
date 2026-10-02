@@ -35,6 +35,7 @@ from roostoo import config as config_mod  # noqa: E402
 from roostoo.backtest import Backtester, load_universe_candles, slice_candles, split_timeline  # noqa: E402
 from roostoo.candles import validate_candles  # noqa: E402
 from roostoo.journal import Journal  # noqa: E402
+from roostoo.metrics import DEFAULT_RATIO_CAP  # noqa: E402
 from roostoo.strategies.base import load_strategy  # noqa: E402
 
 
@@ -223,12 +224,48 @@ def _print_comparison(train, test) -> None:
     ]
     for name, a, b in rows:
         print(f"{name:<20}{_fmt(a):>14}{_fmt(b):>16}")
-    if train.metrics.composite and test.metrics.composite:
-        ratio = test.metrics.composite / train.metrics.composite if train.metrics.composite else 0.0
+
+    # A ratio that reached the cap is a floor, not a measurement. Saying which
+    # columns are saturated is the difference between "Sortino was -10" and
+    # "Sortino was at least -10".
+    capped = [
+        f"{label} {name}"
+        for label, metrics in (("IS", train.metrics), ("OOS", test.metrics))
+        for name, value in (("sharpe", metrics.sharpe), ("sortino", metrics.sortino), ("calmar", metrics.calmar))
+        if value is not None and abs(value) >= DEFAULT_RATIO_CAP - 1e-9
+    ]
+    if capped:
         print(
-            f"\nOOS/IS composite ratio: {ratio:.2f} "
-            f"({'holds up' if ratio > 0.5 else 'likely overfit -- treat with suspicion'})"
+            f"\nnote: {', '.join(capped)} reached the +/-{DEFAULT_RATIO_CAP:g} reporting cap, so those "
+            "figures are lower bounds, not the measured ratio."
         )
+    for label, metrics in (("in-sample", train.metrics), ("out-of-sample", test.metrics)):
+        if metrics.composite_is_partial:
+            print(f"note: the {label} composite is missing at least one ratio; its weights were renormalised.")
+    if test.metrics.periods_per_year == 0:
+        print(
+            "note: the out-of-sample window is under one day, so annualised figures and the composite "
+            "are not reported."
+        )
+
+    # Only meaningful when the in-sample score is a *positive* number. Two
+    # negative composites divide to a positive ratio -- the README's own
+    # headline run gives (-8.94 / -7.13) == 1.25, which the old check printed as
+    # "(holds up)" for a strategy that lost 12% out of sample.
+    is_c, oos_c = train.metrics.composite, test.metrics.composite
+    if is_c is None or oos_c is None:
+        return
+    if is_c <= 0:
+        print(
+            "\nOOS/IS ratio: not interpretable -- both comparisons are losses, so the ratio carries no "
+            "signal about generalisation. Compare total return and drawdown instead."
+        )
+        return
+    ratio = oos_c / is_c
+    print(
+        f"\nOOS/IS composite ratio: {ratio:.2f} "
+        f"({'holds up' if ratio > 0.5 else 'likely overfit -- treat with suspicion'})"
+    )
 
 
 def _fmt(value) -> str:

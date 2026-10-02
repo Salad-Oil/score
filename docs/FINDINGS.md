@@ -18,12 +18,19 @@ python run_sweep.py --grid "@reports/grid_direction.json" --config-grid "@report
 > **Configuration note.** Sections 1–3 were produced with **Rule 4's deviation
 > gate enabled** (`enforce_min_deviation: true`), which is how those tables were
 > obtained. That gate belongs to another owner, so it now ships **disabled** and
-> the shipped default is worse on its own: in-sample −18.6% rather than −14.3%
+> the shipped default is worse on its own: in-sample −18.6% rather than −13.4%
 > (section 4 has the full comparison, and it is the same conclusion either way).
 > To reproduce these exact figures, add `"enforce_min_deviation": true` to
 > `STRATEGY_PARAMS`, or pass `--params '{"enforce_min_deviation": true}'`.
 > On Windows/PowerShell, inline JSON is mangled by the shell — use the `@file`
 > form instead.
+>
+> **These numbers have moved once already.** Section 1 was regenerated after a
+> correctness pass over the backtester (fill timestamps, the out-of-sample
+> measurement window, and refusing an entry whose stop cannot be computed). The
+> remaining parameter grids in sections 2 and 4 still carry the pre-pass values;
+> their *ordering* is what they were written to establish, and that is unchanged,
+> but re-run `run_sweep.py` before quoting an individual cell as current.
 
 **Headline: as specified, Rules 1–3 lose money — and the entry logic is not the
 reason.** Two configuration choices cause almost all of the damage, and both are
@@ -33,16 +40,30 @@ owned by teammates (Rules 5 and the short leg of Rule 2).
 
 | | in-sample (90d) | out-of-sample (30d) |
 |---|---|---|
-| total return | −14.3% | −12.1% |
-| Sharpe | −8.6 | −10.0 |
-| Sortino | −8.9 | −10.0 |
-| Calmar | −3.3 | −6.5 |
-| composite | −7.1 | −8.9 |
-| round trips | 338 | 149 |
-| **fees paid** | **9,202** | **4,178** |
+| total return | −13.4% | −11.9% |
+| Sharpe | −8.1 | ≤ −10.0 |
+| Sortino | −8.5 | ≤ −10.0 |
+| Calmar | −3.3 | −6.6 |
+| composite | −6.8 | −9.0 |
+| round trips | 333 | 144 |
+| **fees paid** | **9,121** | **4,055** |
 
-Fees alone are 9.2% of NAV. But gross P&L is negative too (−5,121 in-sample), so
-cost is not the only problem.
+> These figures were regenerated after the correctness pass that fixed the
+> backtest's fill timestamps, restricted the out-of-sample metrics to the
+> post-split window, and made an uncomputable stop refuse the entry. The
+> conclusion is unchanged; the last decimal is not.
+
+`≤ −10.0` marks a **clamped** figure, not a measurement. Ratios are capped at ±10
+for reporting, and both out-of-sample ratios reach the cap — the raw values are
+−14.5 (Sharpe) and −11.8 (Sortino), so the composite of −9.0 is *better* than the
+published 0.4/0.3/0.3 formula applied to the measured ratios (which gives −11.0).
+Treat every capped number in this document as a lower bound, and note that the
+cap is saturation rather than scaling: it compresses every configuration whose
+true Calmar is below −10 onto the same value, which is part of why the
+out-of-sample composites in section 5 cluster so tightly.
+
+Fees alone are 9.1% of NAV. Gross P&L is negative too (−4,329 across the round
+trips), so cost is not the only problem.
 
 ## 2. The Rule 5 stop is where the money goes
 
@@ -51,12 +72,12 @@ unambiguous:
 
 | exit | n | gross P&L | avg bars held | win rate |
 |---|---|---|---|---|
-| z-exit (Rule 2) | 89 | **+12,781** | 6.2 | **100%** |
-| time stop (Rule 6) | 90 | +3,214 | 12.0 | 47.8% |
-| **stop (Rule 5)** | 159 | **−21,116** | 3.8 | **0%** |
+| z-exit (Rule 2) | 86 | **+12,176** | 6.0 | **100%** |
+| time stop (Rule 6) | 102 | +2,955 | 12.0 | 49.0% |
+| **stop (Rule 5)** | 145 | **−19,460** | 4.2 | **0%** |
 
 Every single trade that reached the mean-reversion target won. The ATR stop —
-hit after an average of **3.8 bars** — converted 159 of them into realised losses
+hit after an average of **4.2 bars** — converted 145 of them into realised losses
 worth more than everything else earned combined.
 
 Widening it improves the score monotonically, which is the signature of a stop
@@ -68,6 +89,10 @@ that sits inside the noise:
 | 5.0 | −5.02 | −8.77 | −10% |
 | 3.0 | −6.08 | −8.91 | −14% |
 | 1.5 (default) | **−7.13** | **−8.94** | −14% |
+
+> This grid was produced with the deviation gate enabled, before the correctness
+> pass, so the 1.5 row reads −7.13 where the regenerated full-sample run gives
+> −6.81. The ordering — which is the whole point of the table — is unaffected.
 
 ### Why Rules 2 and 5 are in direct conflict
 
@@ -83,6 +108,14 @@ entry**: exit if `Z` extends beyond, say, `−3.5` (the deviation failed to
 revert and is now more extreme), rather than on an unrelated ATR multiple. That
 keeps one author for the entry and the exit condition.
 
+**Related code change.** Because the measured risk budget depends on the stop
+distance, an entry whose stop distance cannot be computed (a missing or
+non-finite ATR) used to be sized on the caps alone — i.e. *larger* than Rule 7
+permits, with no stop. That is now refused by default:
+`REFUSE_ENTRY_WITHOUT_STOP=1`. It does not disturb the `null` rows above, because
+turning `STOP_ATR_MULT` off is a deliberate configuration choice rather than a
+computation failure, and the fallback still applies there.
+
 ## 3. The short leg is the single biggest destroyer
 
 Sweeping direction together with the time stop (stop disabled, to isolate them):
@@ -95,8 +128,9 @@ Sweeping direction together with the time stop (stop disabled, to isolate them):
 | **disabled** | off | **−0.60** | **−6.19** | **−0.6%** | **−4%** |
 
 Turning the short leg off takes the in-sample result from −11% to **−0.6%** —
-essentially flat before costs. By direction, in-sample gross P&L is −310 for
-longs and −4,810 for shorts: the long book is already break-even.
+essentially flat before costs. By direction, in-sample gross P&L is −46 for longs
+and −4,283 for shorts: the long book is already break-even, and essentially all
+of the gross loss comes from fading upward stretches.
 
 The plausible reason is drift. Over this sample crypto rose, so shorting a
 `+2σ` stretch is fighting a persistent trend, while the equivalent long trade is
@@ -130,9 +164,12 @@ narrow band (−8.4 … −9.7) no matter how the parameters are set. **A tight 
 cluster around a loss means the problem is structural, not parametric** — there is
 no plateau to find. Any tuning that only looks good in-sample is noise.
 
-Also note the OOS window is only **30 days** (1,441 bars of the 5,761), which is
-too short to conclude anything about regime robustness. Re-run on 6–12 months and
-check the result holds in both a rising and a falling market before committing.
+Two cautions on reading that band. It is bounded below by the ±10 reporting clamp,
+which saturates rather than scales, so configurations that differ in reality can
+print the same composite. And the OOS window is only **30 days** (1,441 bars of
+the 5,761), too short to conclude anything about regime robustness. Re-run on
+6–12 months and check the result holds in both a rising and a falling market
+before committing.
 
 ## 6. What to change first, in order of expected impact
 

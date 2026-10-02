@@ -122,6 +122,11 @@ class BacktestResult:
     bars: int = 0
     universe_events: int = 0
     final_cash: float = 0.0
+    #: First timestamp that belongs to this window's *measurement* period.
+    #: An out-of-sample slice is built with a warm-up prefix so the indicators are
+    #: primed at the split, and those prefix bars must not enter the metrics: their
+    #: flat marks diluted the OOS returns and shortened the annualisation period.
+    metrics_from_ts: Optional[int] = None
 
     # -- derived --------------------------------------------------------
     @property
@@ -171,6 +176,10 @@ class BacktestResult:
         return {
             "label": self.label,
             "metrics": self.metrics.to_dict() if self.metrics else None,
+            # Recorded so a reader can tell which part of `equity` the metrics
+            # were actually computed from: an out-of-sample slice carries a
+            # warm-up prefix that must not be counted as out-of-sample days.
+            "metrics_from_ts": self.metrics_from_ts,
             "trades": len(self.trades),
             "fees_paid": round(self.fees_paid, 4),
             "bars": self.bars,
@@ -267,8 +276,14 @@ class Backtester:
         final_nav = portfolio_nav(self.cash_usd, self.book.positions)
         self.tracker.record(self.timeline[-1] + self.bar_ms, final_nav) if self.timeline else None
         equity = list(self.tracker.snapshots)
-        daily = daily_equity_marks(equity)
-        curve = daily if len(daily) >= 2 else [self.cfg.initial_capital] + [v for _, v in equity]
+        # Measure only from `trade_from_ts`. An out-of-sample slice carries a
+        # warm-up prefix so the indicators are primed at the split; those bars are
+        # not part of the out-of-sample period, and counting their flat marks
+        # diluted the OOS returns and mis-stated the annualisation period.
+        measured = [s for s in equity if self.trade_from_ts is None or s[0] >= self.trade_from_ts] or equity
+        self.result.metrics_from_ts = self.trade_from_ts
+        daily = daily_equity_marks(measured)
+        curve = daily if len(daily) >= 2 else [self.cfg.initial_capital] + [v for _, v in measured]
         self.result.metrics = compute_metrics(
             curve, periods_per_year=self.cfg.periods_per_year, risk_free_rate=self.cfg.risk_free_rate
         )
@@ -351,7 +366,13 @@ class Backtester:
                 reference = float(position.stop_price or candle.close)
             else:
                 reference = candle.close
-            self._fill(signal_to_action(signal, position), reference_price=reference, ts=ts, source=str(trigger))
+            self._fill(
+                signal_to_action(signal, position),
+                reference_price=reference,
+                ts=ts,
+                source=str(trigger),
+                ts_ms=ts + self.bar_ms,
+            )
 
     def _decision(self, ts: int, bars: dict[str, Candle], nav: float) -> None:
         tickers = self._synthetic_tickers(bars)
@@ -453,12 +474,30 @@ class Backtester:
     # ------------------------------------------------------------------
     # Fills
     # ------------------------------------------------------------------
-    def _fill(self, action: ApprovedAction, reference_price: float, ts: int, source: str) -> None:
-        """Apply one action at ``reference_price`` with slippage and fees."""
+    def _fill(
+        self,
+        action: ApprovedAction,
+        reference_price: float,
+        ts: int,
+        source: str,
+        ts_ms: Optional[int] = None,
+    ) -> None:
+        """Apply one action at ``reference_price`` with slippage and fees.
+
+        ``ts`` is the timestamp of the bar whose price was used, and the recorded
+        fill time is derived from it. Stamping every fill with ``ts + bar_ms``
+        labelled each one with the *next* bar's close: an order decided on bar
+        *t* and filled at the open of *t + 1* was journalled 30 minutes later
+        than it happened, so ``trades_*.csv`` -- the artefact
+        ``scripts/analyze_backtest.py`` reads -- did not line up with the bars.
+        A caller that genuinely acts at the close (a stop or an emergency
+        flatten detected on the bar's close) may pass ``ts_ms`` explicitly.
+        """
         if reference_price <= 0:
             return
         slip = self.cfg.slippage_bps / 10_000.0
-        ts_ms = ts + self.bar_ms
+        if ts_ms is None:
+            ts_ms = ts
 
         if action.action == ENTER_LONG:
             price = reference_price * (1.0 + slip)
@@ -553,7 +592,11 @@ class Backtester:
             candle = bars.get(action.pair)
             if candle is None:
                 continue
-            self._fill(action, reference_price=candle.close, ts=ts, source="kill_switch")
+            # The halt was detected on this bar's close, so the flatten is booked
+            # at the close of the bar it happened on, not the one before it.
+            self._fill(
+                action, reference_price=candle.close, ts=ts, source="kill_switch", ts_ms=ts + self.bar_ms
+            )
 
     def _next_ts(self, ts: int) -> Optional[int]:
         try:

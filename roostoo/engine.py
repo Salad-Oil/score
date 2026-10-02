@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from .basis import BasisMonitor
 from .candles import Candle, CandleBuilder, bar_index, load_candles, trading_day_id
-from .client import build_client
+from .client import build_client, is_success
 from .config import Config
 from .journal import Journal
 from .metrics import MetricTracker
@@ -106,7 +106,7 @@ class TradingEngine:
         self.tickers: dict[str, Ticker] = {}
         self.balances: dict[str, WalletBalance] = {}
         self.builder = CandleBuilder(bar_seconds=cfg.bar_seconds, max_bars=cfg.history_window)
-        self.book = PositionBook(Path(cfg.journal_dir) / "positions.json")
+        self.book = PositionBook(Path(cfg.journal_dir) / "positions.json", cfg=cfg)
         self.sizer = PositionSizer(cfg)
         self.risk = RiskManager(cfg, self.sizer)
         self.tracker = MetricTracker(cfg.initial_capital, periods_per_year=cfg.periods_per_year, risk_free_rate=cfg.risk_free_rate)
@@ -117,6 +117,9 @@ class TradingEngine:
         self._last_decision_bar: Optional[int] = None
         self._seed_paths: dict[str, str | Path] = dict(seed_paths or {})
         self._pending_by_pair: dict[str, int] = {}
+        #: Best-known notional per pair with a resting order, so the risk layer
+        #: reserves what is actually committed rather than a flat full slot.
+        self._pending_notional_by_pair: dict[str, float] = {}
         self._shutting_down = False
         #: Gate for ``_persist()``. Stays False until ``bootstrap()`` has
         #: completed, so a startup failure can never overwrite stored state.
@@ -142,6 +145,9 @@ class TradingEngine:
         self.exchange_pairs = {p: tp for p, tp in info.pairs.items() if tp.can_trade}
         if not info.is_running:
             raise RuntimeError("exchange reports IsRunning=false; refusing to trade")
+        # Give the position book the venue's lot sizes, so "this row holds
+        # nothing" is decided on the same threshold reconciliation uses.
+        self.cfg._lot_resolver = lambda pair: 10.0 ** (-self.exchange_pairs[pair].amount_precision)
 
         configured = self.cfg.resolved_pairs()
         self.universe = [p for p in configured if p in self.exchange_pairs] if configured else []
@@ -286,6 +292,7 @@ class TradingEngine:
         protective = self.risk.protective_exits(self.book.held(), tickers, now_ms)
         if protective:
             self.journal.signals(now_ms, protective, diagnostics={"source": "risk.protective_exits"})
+            self._refresh_pending()
             decision = self.risk.evaluate(
                 protective,
                 view=view,
@@ -296,12 +303,22 @@ class TradingEngine:
                 committed_notional=self._pending_notional(view.nav),
             )
             self._execute(decision.approved, now_ms, current_bar)
+            # The exits above changed the book (and possibly the cash), so the
+            # `view` built earlier in this cycle is stale. Rebuild it before the
+            # strategy sees it, or a position closed by a stop this loop is still
+            # reported as open and still consumes a Rule 8/9/10 slot.
+            view = PortfolioView(
+                nav=nav, cash_usd=cash_usd, positions=self.book.held()
+            )
 
         # --- the strategy runs once per closed bar ------------------------
         if on_bar:
-            self._last_decision_bar = current_bar
             self.stats.bars_processed += 1
             self._decision_cycle(now_ms, current_bar, view)
+            # Stamped only after the cycle's work. Stamping before it meant an
+            # exception inside the decision (swallowed by run()) consumed the bar
+            # as if it had been evaluated, so that bar was never acted on.
+            self._last_decision_bar = current_bar
 
         self.journal.equity(now_ms, nav, metrics=self.tracker.metrics().to_dict())
         self._persist()
@@ -337,13 +354,52 @@ class TradingEngine:
         except Exception as exc:
             log.debug("pending_count unavailable: %s", exc)
             self._pending_by_pair = {}
+            self._pending_notional_by_pair = {}
             return
         self._pending_by_pair = dict(by_pair) if total else {}
+        self._pending_notional_by_pair = self._pending_notionals(self._pending_by_pair)
+
+    def _pending_notionals(self, by_pair: dict[str, int]) -> dict[str, float]:
+        """Per-pair committed notional for resting orders, best effort.
+
+        ``pending_count`` reports how many orders rest per pair but not their
+        size, so the exact figure comes from the order history. If that query
+        fails we fall back to one slot per pair -- an over-estimate, which is the
+        safe direction: it can only make the engine more conservative.
+        """
+        out: dict[str, float] = {}
+        if not by_pair:
+            return out
+        try:
+            rows = self.client.query_orders(pending_only=True, limit=100)
+        except Exception as exc:
+            log.debug("pending order detail unavailable (%s); reserving one slot per pair", exc)
+            return out
+        for row in rows or []:
+            pair = str(row.get("Pair", "") or "")
+            if pair not in by_pair:
+                continue
+            try:
+                quantity = float(row.get("Quantity", 0.0) or 0.0)
+                price = float(row.get("Price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                ticker = self.tickers.get(pair)
+                price = ticker.mid if ticker is not None else 0.0
+            if quantity > 0 and price > 0:
+                out[pair] = out.get(pair, 0.0) + quantity * price
+        return out
 
     def _pending_notional(self, nav: float) -> float:
+        """Total notional reserved by orders that are in flight but not filled."""
         if not self._pending_by_pair:
             return 0.0
-        return self.sizer.slot_notional(nav) * len(self._pending_by_pair)
+        slot = self.sizer.slot_notional(nav)
+        total = 0.0
+        for pair in self._pending_by_pair:
+            total += self._pending_notional_by_pair.get(pair, slot)
+        return total
 
     # ------------------------------------------------------------------
     # Universe (Rule 1)
@@ -446,18 +502,28 @@ class TradingEngine:
                 cumulative_volume=ticker.unit_volume,
             )
 
-    def _safe_short_positions(self) -> list[Any]:
+    def _safe_short_positions(self) -> Optional[list[Any]]:
+        """The venue's open shorts, or ``None`` when the question went unanswered.
+
+        ``None`` and ``[]`` are different answers and the caller must not conflate
+        them. ``[]`` means "the venue holds no shorts"; returning ``[]`` for a
+        transport failure made the pruning pass below delete every short in the
+        book -- cost basis, collateral, the Rule 5 stop and the Rule 6 open time,
+        none of which the API can report back.
+        """
         try:
             return self.client.short_positions()
         except Exception as exc:
             # Shorts may be disabled for the competition; that must not be fatal.
-            log.debug("short_positions unavailable: %s", exc)
-            return []
+            log.warning("short_positions unavailable (%s); keeping the book's shorts this cycle", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Reconciliation
     # ------------------------------------------------------------------
-    def _reconcile_positions(self, balances: dict[str, WalletBalance], shorts: list[Any]) -> None:
+    def _reconcile_positions(
+        self, balances: dict[str, WalletBalance], shorts: Optional[list[Any]]
+    ) -> None:
         """Make the local book agree with the exchange.
 
         The exchange is authoritative for *quantity* (it is the thing that
@@ -465,6 +531,12 @@ class TradingEngine:
         stop levels*, which the API never reports. A disagreement means a fill we
         did not see -- an unknown-outcome order, a missed cycle, or a manual
         intervention -- and is journalled rather than silently absorbed.
+
+        A row that is simply *absent* from the payload is not evidence of a flat
+        position. A truncated balance response would otherwise read every missing
+        row as "the exchange holds nothing" and delete the entire book -- the
+        failure this guard exists to prevent. Only an explicit row showing a zero
+        balance closes a position.
         """
         for pair, trade_pair in self.exchange_pairs.items():
             balance = balances.get(trade_pair.coin)
@@ -478,6 +550,23 @@ class TradingEngine:
                 continue
             self.stats.reconciliations += 1
             if exchange_qty <= tolerance:
+                if balance is None:
+                    # No row for this coin at all: the snapshot is incomplete, not
+                    # a flat balance. Keep the position and say so loudly.
+                    log.warning(
+                        "%s: no %s row in the balance payload; keeping the local position "
+                        "(local=%.10f) rather than treating an absent row as a close",
+                        pair,
+                        trade_pair.coin,
+                        local_qty,
+                    )
+                    self.journal.reconciliation(
+                        int(time.time() * 1000),
+                        pair,
+                        "row_missing_kept",
+                        {"local": local_qty, "coin": trade_pair.coin},
+                    )
+                    continue
                 if position is not None and not position.is_short:
                     self.book.positions.pop(pair, None)
                 self.journal.reconciliation(
@@ -514,11 +603,73 @@ class TradingEngine:
                     {"local": local_qty, "exchange": exchange_qty},
                 )
 
+        if shorts is None:
+            # The venue did not answer, so we cannot tell "no shorts" from "we do
+            # not know". Pruning on an unanswered question deletes live positions.
+            return
         short_pairs = {sp.pair for sp in shorts}
         for pair, position in list(self.book.positions.items()):
             if position.is_short and pair not in short_pairs:
                 self.book.positions.pop(pair, None)
                 self.journal.reconciliation(int(time.time() * 1000), pair, "short_closed_externally")
+        for short in shorts:
+            self._adopt_unknown_short(short)
+
+    def _adopt_unknown_short(self, short: Any) -> None:
+        """Book a short the venue reports but the local book does not know about.
+
+        The spot side adopts unknown holdings; the short side did not, so a short
+        opened by an order whose response was lost -- or by any means we did not
+        observe -- stayed invisible to ``portfolio_nav`` and therefore to Rules 5,
+        6, 8, 9 and 10. The venue reports the entry price and collateral, so the
+        position can be reconstructed faithfully; the stop cannot, because Rule 5
+        needs the ATR at entry, so the short is adopted *without* a stop and left
+        to the Rule 6 time stop and the strategy's own exit.
+        """
+        pair = getattr(short, "pair", "")
+        quantity = float(getattr(short, "quantity", 0.0) or 0.0)
+        if not pair or quantity <= 0:
+            return
+        position = self.book.get(pair)
+        if position is not None and position.is_short:
+            # Known short: trust the venue for quantity and collateral drift.
+            if abs(position.quantity - quantity) > max(1e-9, 0.5 * self.cfg.lot_for(pair)):
+                self.journal.reconciliation(
+                    int(time.time() * 1000),
+                    pair,
+                    "short_quantity_corrected",
+                    {"local": position.quantity, "exchange": quantity},
+                )
+                position.quantity = quantity
+            return
+        if position is not None:
+            # A spot holding and a short on the same pair cannot both be tracked
+            # by one book entry. Say so rather than silently replacing it.
+            log.error(
+                "%s: venue reports a short while the book holds a long; leaving the book alone "
+                "and leaving this for a human",
+                pair,
+            )
+            self.journal.reconciliation(int(time.time() * 1000), pair, "short_conflicts_with_long")
+            return
+        entry = float(getattr(short, "entry_price", 0.0) or 0.0)
+        collateral = float(getattr(short, "collateral", 0.0) or 0.0)
+        if entry <= 0:
+            ticker = self.tickers.get(pair)
+            entry = ticker.mid if ticker is not None else 0.0
+        self.book.apply_short_open(pair, quantity, entry, collateral, int(time.time() * 1000), None)
+        self.journal.reconciliation(
+            int(time.time() * 1000),
+            pair,
+            "adopted_unknown_short",
+            {"quantity": quantity, "entry": entry, "collateral": collateral},
+        )
+        log.warning(
+            "%s: adopted short %.10f @ %.8f from the exchange with no Rule 5 stop",
+            pair,
+            quantity,
+            entry,
+        )
 
     # ------------------------------------------------------------------
     # Execution
@@ -559,9 +710,19 @@ class TradingEngine:
         if collateral < 1.0:
             return
         self.stats.orders_sent += 1
-        payload = self.client.short_open(action.pair, collateral)
+        try:
+            payload = self.client.short_open(action.pair, collateral)
+        except Exception as exc:
+            # A transport failure leaves the short's existence unknown, exactly as
+            # it does for a spot order. It cannot be re-sent (that risks a second
+            # position), so record it as unknown and let `_reconcile_positions`
+            # adopt whatever the venue turns out to hold.
+            self.stats.unknown_orders += 1
+            log.error("short_open %s transport failure (state UNKNOWN): %s", action.pair, exc)
+            self.journal.error("execute", f"short_open transport failure: {exc}", ts_ms=now_ms, pair=action.pair)
+            return
         self.journal.order(now_ms, action.to_dict(), result=payload)
-        if not payload.get("Success"):
+        if not is_success(payload):
             self.stats.order_errors += 1
             log.warning("short_open %s rejected: %s", action.pair, payload.get("ErrMsg"))
             return
@@ -585,14 +746,39 @@ class TradingEngine:
         position = self.book.get(action.pair)
         if trade_pair is None or position is None:
             return
-        quantity = self._quantise(trade_pair, position.quantity, position.mark_price)
-        if quantity is None:
-            self.journal.order(now_ms, action.to_dict(), error="nothing sellable above the pair minimum")
-            return
-        # A SELL that would leave dust behind is rounded to the full balance.
-        if quantity < position.quantity * 0.999:
-            quantity = position.quantity
-            quantity = float(fmt(quantity, trade_pair.amount_precision))
+        ticker = self.tickers.get(action.pair)
+        # A held position must always be closable. `mark_price` is only a *local*
+        # estimate -- it can be zero for an adopted holding or a position restored
+        # from a bad state file -- so fall back to the live quote and then to the
+        # entry price. Refusing to sell because the reference price is unusable
+        # turned a bad mark into a position that nothing, not even the kill
+        # switch, could exit.
+        reference = position.mark_price if position.mark_price > 0 else 0.0
+        if reference <= 0 and ticker is not None and ticker.mid > 0:
+            reference = ticker.mid
+        if reference <= 0 and position.avg_price > 0:
+            reference = position.avg_price
+        if reference <= 0:
+            # Nothing to price the minimum against; sell the whole holding rather
+            # than leaving it stranded.
+            quantity = float(fmt(position.quantity, trade_pair.amount_precision))
+            if quantity <= 0:
+                self.journal.order(now_ms, action.to_dict(), error="position quantity rounds to zero")
+                return
+            log.warning(
+                "%s: no usable price for the minimum-order check; selling the full balance %.10f",
+                action.pair,
+                quantity,
+            )
+        else:
+            quantity = self._quantise(trade_pair, position.quantity, reference)
+            if quantity is None:
+                self.journal.order(now_ms, action.to_dict(), error="nothing sellable above the pair minimum")
+                return
+            # A SELL that would leave dust behind is rounded to the full balance.
+            if quantity < position.quantity * 0.999:
+                quantity = position.quantity
+                quantity = float(fmt(quantity, trade_pair.amount_precision))
 
         self.stats.orders_sent += 1
         result = self.client.place_order(action.pair, "SELL", trade_pair.round_qty(quantity), "MARKET")
@@ -601,14 +787,32 @@ class TradingEngine:
 
     def _exit_short(self, action: ApprovedAction, now_ms: int, current_bar: int) -> None:
         self.stats.orders_sent += 1
-        payload = self.client.short_close(action.pair)
+        try:
+            payload = self.client.short_close(action.pair)
+        except Exception as exc:
+            self.stats.unknown_orders += 1
+            log.error("short_close %s transport failure (state UNKNOWN): %s", action.pair, exc)
+            self.journal.error("execute", f"short_close transport failure: {exc}", ts_ms=now_ms, pair=action.pair)
+            return
         self.journal.order(now_ms, action.to_dict(), result=payload)
-        if not payload.get("Success"):
+        if not is_success(payload):
             self.stats.order_errors += 1
             log.warning("short_close %s rejected: %s", action.pair, payload.get("ErrMsg"))
             return
         closed = float(payload.get("ClosedQty", 0.0) or 0.0)
+        remaining = payload.get("RemainingQty")
         price = float(payload.get("ClosePrice", 0.0) or 0.0)
+        if closed <= 0:
+            # A success payload with nothing closed: do not count an exit or start
+            # a Rule 12 cooldown for a position that is still open.
+            self.stats.order_errors += 1
+            log.warning(
+                "short_close %s reported Success but ClosedQty=%r (FullyClosed=%r); position left open",
+                action.pair,
+                payload.get("ClosedQty"),
+                payload.get("FullyClosed"),
+            )
+            return
         self.book.apply_short_close(action.pair, closed, price)
         self.stats.exits += 1
         self.risk.record_exit(action.pair, current_bar)
@@ -634,7 +838,40 @@ class TradingEngine:
             # Resting limit order: no position change yet.
             return
 
-        filled = result.filled_quantity or result.quantity
+        # A FILLED status with no filled quantity is a contradiction -- the venue
+        # told us the order went through but reported zero units. Booking
+        # `action.quantity` instead (the old behaviour) invents a position that
+        # may never have existed, at a price that may be zero. Refuse it and let
+        # the next cycle's balance reconciliation settle the truth.
+        if not (result.filled_quantity > 0):
+            self.stats.order_errors += 1
+            log.error(
+                "%s %s reported FILLED with filled_quantity=%r; not booking a position "
+                "(reconciliation will settle it)",
+                result.side,
+                action.pair,
+                result.filled_quantity,
+            )
+            self.journal.error(
+                "execute",
+                "FILLED with no filled quantity; refusing to book",
+                ts_ms=now_ms,
+                pair=action.pair,
+                status=result.status,
+                filled=result.filled_quantity,
+            )
+            return
+
+        filled = result.filled_quantity
+        if not (result.avg_fill_price > 0):
+            self.stats.order_errors += 1
+            log.error(
+                "%s %s filled with no usable average price (%r); not booking a position",
+                result.side,
+                action.pair,
+                result.avg_fill_price,
+            )
+            return
         price = result.avg_fill_price or (action.price or 0.0)
         if result.side == "BUY":
             self.book.apply_spot_buy(action.pair, filled, price, now_ms, action.stop_price)
@@ -654,8 +891,17 @@ class TradingEngine:
         """Did an UNKNOWN order actually land?
 
         Never re-send. Ask the order history instead: if an order for this pair
-        was created after we sent the request and matches the side and quantity,
-        treat it as ours; otherwise treat it as not placed.
+        was created after we sent the request and matches the side, the quantity
+        and is genuinely filled, treat it as ours; otherwise treat it as not
+        placed.
+
+        Every clause here is load-bearing. Matching on side and recency alone
+        accepted a *cancelled* order of an unrelated size as proof that our order
+        went through -- so the position was never booked and the intent was
+        silently dropped. And because ``OrderResult.from_api`` reads whatever the
+        row happens to contain, a row with no ``Status`` used to arrive as
+        ``FILLED`` with ``FilledQuantity=0``, which the execution path then booked
+        as a full-size position at price zero.
         """
         try:
             rows = self.client.query_orders(pair=action.pair, limit=20)
@@ -664,16 +910,37 @@ class TradingEngine:
             log.error("cannot reconcile unknown order for %s: %s", action.pair, exc)
             return None
 
+        trade_pair = self.exchange_pairs.get(action.pair)
+        # One lot, with the same half-lot slack the balance reconciliation uses.
+        lot = 10.0 ** (-trade_pair.amount_precision) if trade_pair is not None else 1e-9
+        tolerance = max(1e-9, 0.5 * lot)
+
         cutoff = now_ms - 120_000
+        expected_side = "BUY" if action.action == ENTER_LONG else "SELL"
         for row in rows:
             created = int(row.get("CreateTimestamp", 0) or 0)
             side = str(row.get("Side", "")).upper()
-            expected_side = "BUY" if action.action == ENTER_LONG else "SELL"
-            if created >= cutoff and side == expected_side:
-                self.journal.reconciliation(
-                    now_ms, action.pair, "order_found", {"order_id": row.get("OrderID"), "status": row.get("Status")}
-                )
-                return OrderResult.from_api(action.pair, expected_side, "MARKET", action.quantity, {"Success": True, "OrderDetail": row})
+            status = str(row.get("Status", "") or "").upper()
+            quantity = float(row.get("Quantity", 0.0) or 0.0)
+            filled = float(row.get("FilledQuantity", 0.0) or 0.0)
+            if created < cutoff or side != expected_side:
+                continue
+            if status != "FILLED":
+                # Cancelled, rejected or still resting: not evidence our order landed.
+                continue
+            if quantity <= 0 or abs(quantity - action.quantity) > tolerance:
+                continue
+            if filled <= 0:
+                continue
+            self.journal.reconciliation(
+                now_ms,
+                action.pair,
+                "order_found",
+                {"order_id": row.get("OrderID"), "status": status, "filled": filled},
+            )
+            return OrderResult.from_api(
+                action.pair, expected_side, "MARKET", action.quantity, {"Success": True, "OrderDetail": row}
+            )
         self.journal.reconciliation(now_ms, action.pair, "order_not_found", {"reason": result.err_msg})
         return None
 
@@ -703,6 +970,11 @@ class TradingEngine:
         The quote currency must be present. An absent ``USD`` row means either a
         partial response or a venue that renamed its quote asset; either way the
         numbers derived from it are fiction, so the cycle is skipped.
+
+        This is necessary but not sufficient -- a payload can carry USD and
+        nothing else, which prices the portfolio correctly while saying nothing
+        about the coins we hold. ``_reconcile_positions`` therefore refuses to
+        close a position on a *missing* row and only acts on an explicit zero.
         """
         return "USD" in balances
 
@@ -725,12 +997,25 @@ class TradingEngine:
             import json
 
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError(f"state file is a {type(payload).__name__}, not an object")
+            risk_payload = payload.get("risk") or {}
+            if not isinstance(risk_payload, dict):
+                raise ValueError(f"risk state is a {type(risk_payload).__name__}, not an object")
+            self.risk.restore(risk_payload)
+            last_bar = payload.get("last_decision_bar")
+            self._last_decision_bar = int(last_bar) if last_bar is not None else None
         except Exception as exc:
-            log.error("could not read engine state: %s", exc)
+            # A well-formed-JSON file with a wrong *type* in it used to abort
+            # bootstrap() with `_ready` still False, so `_persist` refused to
+            # write and `Restart=always` turned one bad field into a restart loop
+            # that never traded. Losing the risk state is bad; never starting is
+            # worse. Start from the defaults, loudly, and let the file be
+            # rewritten by the first successful cycle.
+            log.error("could not read engine state (%s); starting from default risk state", exc)
+            self.risk.restore({})
+            self._last_decision_bar = None
             return
-        self.risk.restore(payload.get("risk") or {})
-        last_bar = payload.get("last_decision_bar")
-        self._last_decision_bar = int(last_bar) if last_bar is not None else None
         if self.risk.halted:
             log.error("restored a HALTED state (%s); the kill switch requires a deliberate reset", self.risk.halt_reason)
 
@@ -758,7 +1043,7 @@ class TradingEngine:
             path = self._state_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
             tmp.replace(path)
         except Exception as exc:
             log.error("could not persist engine state: %s", exc)

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -270,7 +271,11 @@ class CandleBuilder:
         cumulative_volume: Optional[float] = None,
     ) -> Optional[Candle]:
         """Record one observation; return the bar that just closed, if any."""
-        if price <= 0:
+        # `price <= 0` is False for NaN, so an explicit finiteness test is what
+        # actually keeps a poisoned sample out. A NaN here propagates into the
+        # bar's high/low/close and then into ATR/ADX for the whole Wilder window,
+        # and a NaN ATR is what silently approved stop-free entries downstream.
+        if not math.isfinite(price) or price <= 0:
             return None
         bucket = bar_open_ms(ts_ms, self.bar_seconds)
         state = self._open.get(pair)

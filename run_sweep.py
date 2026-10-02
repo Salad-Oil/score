@@ -198,11 +198,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             row[f"fees_{label}"] = round(result.fees_paid, 2)
         row["seconds"] = round(time.time() - started, 2)
         is_c, oos_c = row.get("composite_is"), row.get("composite_oos")
-        # A ratio is only meaningful when the in-sample score is comfortably away
-        # from zero. Around zero it explodes, and a "holds up" flag derived from it
-        # would be actively misleading -- e.g. an IS composite of -0.60 against an
-        # OOS of -6.19 reads as "10.34, ok". Suppress it rather than show that.
-        if is_c is not None and oos_c is not None and abs(is_c) >= 0.5:
+        # A ratio is only meaningful when the in-sample score is a positive number
+        # comfortably away from zero. Two *negative* composites divide to a
+        # positive ratio -- the default configuration's -8.94 / -7.13 reads as
+        # "1.25, ok" while losing money in both windows. Suppress anything that
+        # cannot carry the "generalises" meaning the flag implies.
+        if is_c is not None and oos_c is not None and is_c >= 0.5:
             row["overfit_ratio"] = oos_c / is_c
         else:
             row["overfit_ratio"] = None

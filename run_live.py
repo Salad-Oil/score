@@ -31,6 +31,11 @@ from roostoo.universe import build_depth_provider  # noqa: E402
 
 log = logging.getLogger("run_live")
 
+#: Exit status when the portfolio kill switch has fired. The state is persisted as
+#: halted, so restarting cannot help -- the unit declares this status a clean stop
+#: (`SuccessExitStatus`) instead of letting `Restart=always` thrash.
+HALTED_EXIT_STATUS = 3
+
 
 # ---------------------------------------------------------------------------
 # Read-only venue check
@@ -290,6 +295,16 @@ def main(argv: list[str] | None = None) -> int:
                 log.info("journal summary: %s", engine.journal.summary())
             except Exception:
                 pass
+
+    if engine.risk.halted:
+        # Exit non-zero so the supervisor can tell "the kill switch fired and the
+        # state is deliberately halted" from "the process crashed and should come
+        # back". The unit maps this code to a clean stop (SuccessExitStatus), so a
+        # halted bot no longer restarts ten times, re-flattening an empty book,
+        # before systemd marks the unit failed. The halt itself is persisted, so a
+        # human has to reset it either way.
+        log.error("halting: %s", engine.risk.halt_reason)
+        return HALTED_EXIT_STATUS
     return 0
 
 

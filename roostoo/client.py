@@ -75,6 +75,27 @@ def canonical_params(params: dict[str, Any]) -> str:
     return "&".join(f"{key}={params[key]}" for key in sorted(params))
 
 
+#: Values the venue is accepted to send for a successful call. Anything else --
+#: including a missing flag -- is a failure. `is False` was too narrow: a payload
+#: carrying `0`, `"false"` or no `Success` key at all was read as a success, so a
+#: rejected order reached the engine as a completed fill.
+_SUCCESS_VALUES = (True, 1, "1", "true", "TRUE", "True", "yes")
+
+
+def _is_success(payload: dict[str, Any]) -> bool:
+    """Has the venue affirmatively reported success?"""
+    return payload.get("Success") in _SUCCESS_VALUES
+
+
+def is_success(payload: dict[str, Any]) -> bool:
+    """Public form of :func:`_is_success`, for callers checking raw payloads.
+
+    The v6 short endpoints return their own dicts rather than an ``OrderResult``,
+    so the engine needs the same rule here instead of testing truthiness itself.
+    """
+    return _is_success(payload)
+
+
 def sign_payload(canonical: str, secret_key: str) -> str:
     """Hex HMAC-SHA256 of ``canonical`` keyed by the account's secret."""
     return hmac.new(secret_key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -204,6 +225,31 @@ class RoostooClient:
                 self._sleep(wait)
             self._last_request_at = self._clock()
 
+    def _prepare(
+        self, method: str, path: str, params: dict[str, Any], signed: bool
+    ) -> tuple[str, Optional[bytes], dict[str, str]]:
+        """Build the URL, body and headers for one attempt.
+
+        Called inside the retry loop rather than once outside it. The signed
+        timestamp is part of what is signed, and the venue rejects anything more
+        than 60 s from its own clock, so a retry that re-sent the first attempt's
+        signature would be sending a stale credential -- the backoff, the throttle
+        floor and the original round trip all add up between attempts.
+        """
+        params = dict(params)
+        headers = {"Accept": "application/json", "User-Agent": "roostoo-quant-bot/0.1"}
+        if signed:
+            params["timestamp"] = self.timestamp_ms()
+            body_str: Optional[str] = canonical_params(params)
+            headers.update(self.sign_headers(params, canonical=body_str))
+        else:
+            body_str = None
+
+        if method == "GET":
+            return f"{self.base_url}{path}?{canonical_params(params)}", None, headers
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        return f"{self.base_url}{path}", (body_str or canonical_params(params)).encode("utf-8"), headers
+
     def _call(
         self,
         method: str,
@@ -211,27 +257,16 @@ class RoostooClient:
         params: dict[str, Any],
         *,
         signed: bool,
-        retries: int = 0,
+        retries: Optional[int] = None,
     ) -> dict[str, Any]:
-        params = dict(params)
-        headers = {"Accept": "application/json", "User-Agent": "roostoo-quant-bot/0.1"}
-        if signed:
-            params["timestamp"] = self.timestamp_ms()
-            body_str = canonical_params(params)
-            headers.update(self.sign_headers(params, canonical=body_str))
-        else:
-            body_str = None
-
-        if method == "GET":
-            url = f"{self.base_url}{path}?{canonical_params(params)}"
-            body: Optional[bytes] = None
-        else:
-            url = f"{self.base_url}{path}"
-            body = (body_str or canonical_params(params)).encode("utf-8")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-
+        # `MAX_RETRIES` used to be configuration in name only: every call site
+        # hard-coded its own budget, so an operator raising it changed nothing.
+        # Non-idempotent endpoints still pass an explicit 0.
+        if retries is None:
+            retries = max(0, int(self.cfg.max_retries))
         attempt = 0
         while True:
+            url, body, headers = self._prepare(method, path, params, signed)
             self._throttle()
             self._request_count += 1
             try:
@@ -244,9 +279,15 @@ class RoostooClient:
                 self._consecutive_failures += 1
                 raise
 
-            if status >= 500:
+            retryable = status >= 500 or status in (408, 425, 429)
+            if retryable:
                 if attempt < retries:
                     attempt += 1
+                    # 429 is the rate limiter, not a malformed request: the venue
+                    # warns that bursts earn failed responses, so back off and try
+                    # again instead of losing the whole cycle. (`Retry-After` is a
+                    # response *header*, which the Transport seam does not surface;
+                    # the exponential backoff below stands in for it.)
                     log.warning("%s %s -> HTTP %s, retry %d/%d", method, path, status, attempt, retries)
                     self._backoff(attempt)
                     continue
@@ -254,7 +295,8 @@ class RoostooClient:
                 raise TransportError(f"{method} {path} -> HTTP {status}: {text[:300]}")
 
             if status >= 400:
-                # A 4xx is our fault (bad signature, bad params): retrying cannot help.
+                # Any other 4xx is our fault (bad signature, bad params), which
+                # retrying cannot fix.
                 raise TransportError(f"{method} {path} -> HTTP {status}: {text[:300]}")
 
             self._consecutive_failures = 0
@@ -273,8 +315,10 @@ class RoostooClient:
             raise TransportError(f"{path} returned non-JSON payload: {text[:300]!r}") from exc
         if not isinstance(payload, dict):
             raise TransportError(f"{path} returned unexpected payload type {type(payload).__name__}")
-        if payload.get("Success") is False:
+        if not _is_success(payload):
             err_msg = str(payload.get("ErrMsg", "unknown error") or "unknown error")
+            if "Success" not in payload:
+                err_msg = "response carried no Success flag"
             empty_token = _EMPTY_IS_NORMAL.get(path)
             if empty_token and empty_token in err_msg.lower():
                 # Documented empty state, not an error.
@@ -287,10 +331,10 @@ class RoostooClient:
         return self._request_count
 
     # -- public (unsigned) ---------------------------------------------
-    def exchange_info(self, retries: int = 1) -> ExchangeInfo:
+    def exchange_info(self, retries: Optional[int] = None) -> ExchangeInfo:
         return ExchangeInfo.from_api(self._call("GET", PATH_EXCHANGE_INFO, {}, signed=False, retries=retries))
 
-    def ticker(self, pair: Optional[str] = None, retries: int = 1) -> dict[str, Ticker]:
+    def ticker(self, pair: Optional[str] = None, retries: Optional[int] = None) -> dict[str, Ticker]:
         params: dict[str, Any] = {}
         if pair:
             params["pair"] = pair

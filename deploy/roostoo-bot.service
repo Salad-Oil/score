@@ -21,6 +21,13 @@ ExecStart=/usr/bin/python3 /opt/roostoo-quant-bot/run_live.py --env /opt/roostoo
 # A 14-day unattended run on a spot instance: always come back.
 Restart=always
 RestartSec=15
+# `run_live.py` exits 3 when the portfolio kill switch has fired. That state is
+# persisted as halted, so a restart cannot recover anything -- without this,
+# `Restart=always` restarted the halted bot ~10 times (StartLimitBurst) before
+# systemd marked the unit failed, re-flattening an already-flat book each time.
+# Declaring 3 a success turns "deliberately halted, needs a human" into the clean
+# stop it is, while a real crash (any other status) still restarts.
+SuccessExitStatus=3
 # Give the shutdown handler time to persist state. NOTE: do NOT add
 # --flatten-on-exit here -- a crash-loop would then liquidate the book every time
 # the unit restarts. Flatten only in a deliberate, attended stop.

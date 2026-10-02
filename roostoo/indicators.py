@@ -330,34 +330,57 @@ def _wilder(values: Sequence[float], period: int) -> list[float]:
     Note the seeding convention: the first output is the *sum* of the first
     ``period`` inputs, so dividing the last element by ``period`` yields
     Wilder's average. TR/+DM/-DM use it as a sum; ADX uses it as an average.
+
+    Non-finite inputs are treated as "no observation" and skipped rather than
+    folded into the running sum. A running sum is exactly the wrong place for a
+    NaN: one poisoned sample would otherwise invalidate every later ATR/ADX
+    reading for the rest of the window, and a NaN ATR is what used to approve a
+    stop-free entry.
     """
     data = [float(v) for v in values]
-    if period < 1 or len(data) < period:
+    usable = [v for v in data if math.isfinite(v)]
+    if period < 1 or len(usable) < period:
         return []
-    out = [sum(data[:period])]
-    for value in data[period:]:
+    out = [sum(usable[:period])]
+    for value in usable[period:]:
         out.append(out[-1] - out[-1] / period + value)
     return out
 
 
 def true_range(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float]) -> list[float]:
-    """Wilder's true range, one value per bar after the first."""
+    """Wilder's true range, one value per bar after the first.
+
+    Length stays ``n - 1`` so it lines up with the directional-movement series
+    that :func:`directional_movement` zips it against; a bar with a non-finite
+    input is marked ``nan`` (and skipped by :func:`_wilder`) instead of being
+    dropped, which would silently shift every later value by one bar.
+    """
     n = min(len(highs), len(lows), len(closes))
     out: list[float] = []
     for i in range(1, n):
-        prev_close = closes[i - 1]
-        out.append(max(highs[i] - lows[i], abs(highs[i] - prev_close), abs(lows[i] - prev_close)))
+        high, low = float(highs[i]), float(lows[i])
+        prev_close = float(closes[i - 1])
+        if not (math.isfinite(high) and math.isfinite(low) and math.isfinite(prev_close)):
+            out.append(math.nan)
+            continue
+        out.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
     return out
 
 
 def atr_wilder(
     highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int = 14
 ) -> Optional[float]:
-    """Wilder's Average True Range -- the unit for Rule 5's stop distance."""
+    """Wilder's Average True Range -- the unit for Rule 5's stop distance.
+
+    Returns ``None`` rather than a non-finite value. The risk layer treats a
+    missing ATR as "no stop distance available", and the caller must then refuse
+    the entry instead of approving a position with no stop at all.
+    """
     smoothed = _wilder(true_range(highs, lows, closes), period)
     if not smoothed:
         return None
-    return smoothed[-1] / period
+    value = smoothed[-1] / period
+    return value if math.isfinite(value) else None
 
 
 def directional_movement(
@@ -405,7 +428,14 @@ def directional_movement(
     adx_smooth = _wilder(dx_values, period)
     if not adx_smooth:
         return None
-    return plus_di_last, minus_di_last, adx_smooth[-1] / period, dx_values[-1]
+    adx_value = adx_smooth[-1] / period
+    if not (math.isfinite(adx_value) and math.isfinite(plus_di_last) and math.isfinite(minus_di_last)):
+        # A non-finite ADX must read as "unknown", not as a number. The Rule 3
+        # gate compares it with `>=`, and `nan >= 25.0` is False -- so a NaN ADX
+        # would wave through exactly the trending market the filter exists to
+        # refuse.
+        return None
+    return plus_di_last, minus_di_last, adx_value, dx_values[-1]
 
 
 def adx(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int = 14) -> Optional[float]:

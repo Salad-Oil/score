@@ -207,6 +207,11 @@ class Config:
     take_profit_pct: Optional[float] = None
     trailing_stop_pct: Optional[float] = None
     crash_filter_pct: float = 0.12
+    #: Refuse an entry whose stop distance could not be computed (a missing or
+    #: non-finite ATR). Without this, an uncomputable stop silently produced a
+    #: *full-size* position with no stop: Rule 7's 0.5% risk budget was reported
+    #: as unenforceable and the size fell back to the per-pair cap.
+    refuse_entry_without_stop: bool = True
 
     # costs
     taker_fee: float = DEFAULT_TAKER_FEE
@@ -274,6 +279,7 @@ class Config:
             take_profit_pct=_as_optional_float(env, "TAKE_PROFIT_PCT", None),
             trailing_stop_pct=_as_optional_float(env, "TRAILING_STOP_PCT", None),
             crash_filter_pct=_as_float(env, "CRASH_FILTER_PCT", 0.12),
+            refuse_entry_without_stop=_as_bool(_get(env, "REFUSE_ENTRY_WITHOUT_STOP"), True),
             taker_fee=_as_float(env, "TAKER_FEE", DEFAULT_TAKER_FEE),
             maker_fee=_as_float(env, "MAKER_FEE", DEFAULT_MAKER_FEE),
             slippage_bps=_as_float(env, "SLIPPAGE_BPS", 5.0),
@@ -359,6 +365,23 @@ class Config:
 
     def fee_for(self, order_type: str) -> float:
         return self.maker_fee if order_type.upper() == "LIMIT" else self.taker_fee
+
+    def lot_for(self, pair: str) -> float:
+        """Smallest tradable quantity increment for ``pair``.
+
+        ``exchange_info`` is the only source of ``AmountPrecision``, so this reads
+        it from the live venue description if the engine has one. The 1e-9
+        fallback keeps callers total before the venue has been contacted.
+        """
+        resolver = getattr(self, "_lot_resolver", None)
+        if callable(resolver):
+            try:
+                lot = float(resolver(pair))
+                if lot > 0:
+                    return lot
+            except Exception:
+                pass
+        return 1e-9
 
     def bars_per_day(self) -> float:
         return 86_400.0 / float(self.bar_seconds)

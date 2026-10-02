@@ -44,13 +44,12 @@ jobs:
   secrets:
     # TWO scanners, because they see different things.
     #
-    # This job is RED while the known-leaked test key is still in the history --
-    # see docs/SECURITY.md. That is deliberate: it is the reminder, and a green
-    # tick here would falsely say the repository is clean.
-    #
-    # It is deliberately NOT part of the required `ci` check, so it cannot block
-    # an unrelated merge. Add it to the ruleset's required checks once the purge
-    # is done.
+    # HISTORY HAS SINCE BEEN PURGED (see docs/SECURITY.md), so this job is green
+    # on a clean tree. It is deliberately NOT part of the required `ci` check
+    # yet. That exemption was granted because the job was red while the leaked
+    # key was still in history; the purge removed that reason, so the remaining
+    # action is to add `secret-scan` to the ruleset's required checks. Until
+    # then a credential can still be merged into main.
     name: secret-scan
     runs-on: ubuntu-latest
     steps:
