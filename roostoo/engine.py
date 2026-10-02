@@ -18,6 +18,7 @@ Design constraints this file has to satisfy at once:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -616,56 +617,103 @@ class TradingEngine:
             self._adopt_unknown_short(short)
 
     def _adopt_unknown_short(self, short: Any) -> None:
-        """Book a short the venue reports but the local book does not know about.
-
-        The spot side adopts unknown holdings; the short side did not, so a short
-        opened by an order whose response was lost -- or by any means we did not
-        observe -- stayed invisible to ``portfolio_nav`` and therefore to Rules 5,
-        6, 8, 9 and 10. The venue reports the entry price and collateral, so the
-        position can be reconstructed faithfully; the stop cannot, because Rule 5
-        needs the ATR at entry, so the short is adopted *without* a stop and left
-        to the Rule 6 time stop and the strategy's own exit.
-        """
+        """恢复交易所空头，保留真实开仓时间和本地止损。"""
         pair = getattr(short, "pair", "")
         quantity = float(getattr(short, "quantity", 0.0) or 0.0)
-        if not pair or quantity <= 0:
+        if not pair or not math.isfinite(quantity) or quantity <= 0:
             return
-        position = self.book.get(pair)
-        if position is not None and position.is_short:
-            # Known short: trust the venue for quantity and collateral drift.
-            if abs(position.quantity - quantity) > max(1e-9, 0.5 * self.cfg.lot_for(pair)):
-                self.journal.reconciliation(
-                    int(time.time() * 1000),
-                    pair,
-                    "short_quantity_corrected",
-                    {"local": position.quantity, "exchange": quantity},
-                )
-                position.quantity = quantity
-            return
-        if position is not None:
-            # A spot holding and a short on the same pair cannot both be tracked
-            # by one book entry. Say so rather than silently replacing it.
-            log.error(
-                "%s: venue reports a short while the book holds a long; leaving the book alone "
-                "and leaving this for a human",
-                pair,
-            )
-            self.journal.reconciliation(int(time.time() * 1000), pair, "short_conflicts_with_long")
-            return
+
+        now_ms = int(time.time() * 1000)
         entry = float(getattr(short, "entry_price", 0.0) or 0.0)
         collateral = float(getattr(short, "collateral", 0.0) or 0.0)
-        if entry <= 0:
+
+        try:
+            created = int(getattr(short, "created_ts_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            created = 0
+
+        valid_created = 0 < created <= now_ms
+        opened_ts_ms = created if valid_created else now_ms
+
+        position = self.book.get(pair)
+
+        # 已有空头：同步交易所字段，保留原有止损。
+        if position is not None and position.is_short:
+            before = {
+                "quantity": position.quantity,
+                "entry": position.avg_price,
+                "collateral": position.collateral,
+                "opened_ts_ms": position.opened_ts_ms,
+            }
+
+            position.quantity = quantity
+
+            if math.isfinite(entry) and entry > 0:
+                position.avg_price = entry
+            if math.isfinite(collateral) and collateral >= 0:
+                position.collateral = collateral
+            if valid_created:
+                position.opened_ts_ms = created
+
+            after = {
+                "quantity": position.quantity,
+                "entry": position.avg_price,
+                "collateral": position.collateral,
+                "opened_ts_ms": position.opened_ts_ms,
+            }
+
+            if before != after:
+                self.journal.reconciliation(
+                    now_ms,
+                    pair,
+                    "short_state_corrected",
+                    {"local": before, "exchange": after},
+                )
+            return
+
+        # 同一币对已有多头，不能直接用空头覆盖。
+        if position is not None:
+            log.error(
+                "%s: venue reports a short while the book holds a long",
+                pair,
+            )
+            self.journal.reconciliation(
+                now_ms, pair, "short_conflicts_with_long"
+            )
+            return
+
+        # 新恢复的空头：使用交易所开仓时间。
+        if not math.isfinite(entry) or entry <= 0:
             ticker = self.tickers.get(pair)
             entry = ticker.mid if ticker is not None else 0.0
-        self.book.apply_short_open(pair, quantity, entry, collateral, int(time.time() * 1000), None)
+
+        if not math.isfinite(collateral) or collateral < 0:
+            log.error("%s: invalid short collateral; cannot adopt", pair)
+            return
+
+        self.book.apply_short_open(
+            pair,
+            quantity,
+            entry,
+            collateral,
+            opened_ts_ms,
+            None,
+        )
+
         self.journal.reconciliation(
-            int(time.time() * 1000),
+            now_ms,
             pair,
             "adopted_unknown_short",
-            {"quantity": quantity, "entry": entry, "collateral": collateral},
+            {
+                "quantity": quantity,
+                "entry": entry,
+                "collateral": collateral,
+                "opened_ts_ms": opened_ts_ms,
+            },
         )
+
         log.warning(
-            "%s: adopted short %.10f @ %.8f from the exchange with no Rule 5 stop",
+            "%s: adopted short %.10f @ %.8f with no Rule 5 stop",
             pair,
             quantity,
             entry,
