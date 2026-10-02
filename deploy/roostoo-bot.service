@@ -28,6 +28,7 @@ RestartSec=15
 # Declaring 3 a success turns "deliberately halted, needs a human" into the clean
 # stop it is, while a real crash (any other status) still restarts.
 SuccessExitStatus=3
+RestartPreventExitStatus=3
 # Give the shutdown handler time to persist state. NOTE: do NOT add
 # --flatten-on-exit here -- a crash-loop would then liquidate the book every time
 # the unit restarts. Flatten only in a deliberate, attended stop.
