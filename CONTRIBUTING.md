@@ -1,4 +1,4 @@
-﻿# Collaborating on this repository
+# Collaborating on this repository
 
 Four people, twelve rules, **one deployed bot**. The bot that runs on EC2 is a
 single artifact, so the work has to converge in one place: this repository.
@@ -18,11 +18,11 @@ same file.
 | Owner | Files | Rules |
 |---|---|---|
 | (you) | `roostoo/universe.py`, `roostoo/strategies/mean_reversion.py` | **1, 2, 3** |
-| teammate A | `roostoo/risk.py` 鈥?`protective_exits`, `PositionSizer` | 5, 6, 7 |
-| teammate B | `roostoo/risk.py` 鈥?`RiskManager.evaluate`, `observe` | 8, 9, 10, 11, 12 |
+| teammate A | `roostoo/risk.py` — `protective_exits`, `PositionSizer` | 5, 6, 7 |
+| teammate B | `roostoo/risk.py` — `RiskManager.evaluate`, `observe` | 8, 9, 10, 11, 12 |
 | shared | `roostoo/strategies/base.py`, `roostoo/config.py` | the interface |
 
-`roostoo/risk.py` is the one genuine hotspot: Rules 5鈥?2 all live in it. Two
+`roostoo/risk.py` is the one genuine hotspot: Rules 5–12 all live in it. Two
 options, pick one on day one:
 
 1. **One owner for `risk.py`**; the other person reviews and sends parameters.
@@ -33,14 +33,14 @@ options, pick one on day one:
 
 Everything currently in `risk.py` is a **replaceable default**, not a claim of
 authorship: the files were scaffolded so the bot could run end-to-end, and the
-teammates who own Rules 4鈥?2 are free to delete and rewrite any of it.
+teammates who own Rules 4–12 are free to delete and rewrite any of it.
 
 ## The two interfaces (freeze these)
 
 Everything else is an implementation detail. Changing either of these needs
 agreement from all four people, because everything depends on them:
 
-**1. `Strategy` (`roostoo/strategies/base.py`)** 鈥?a strategy is a pure function
+**1. `Strategy` (`roostoo/strategies/base.py`)** — a strategy is a pure function
 of market state:
 
 ```python
@@ -52,7 +52,7 @@ it is *allowed* to trade. Size belongs to the risk layer; approval belongs to th
 engine. That is what lets the identical strategy code run in the backtester and
 live.
 
-**2. `RiskManager` (`roostoo/risk.py`)** 鈥?the approval gate:
+**2. `RiskManager` (`roostoo/risk.py`)** — the approval gate:
 
 ```python
 risk.observe(nav, now_ms)                    # day boundary, peak NAV, halts
@@ -96,7 +96,7 @@ git push -u origin rule5-atr-stop     # then open a Pull Request
 ```
 
 * **Never commit `.env`.** It is git-ignored; keys live only on the machine that
-  runs the bot. If a key is ever committed, rotate it 鈥?deleting the commit is
+  runs the bot. If a key is ever committed, rotate it — deleting the commit is
   not enough.
 * **CI must pass.** `.github/workflows/ci.yml` runs the 405 unit tests on
   Python 3.10 and 3.13, byte-compiles everything (which is what catches a file

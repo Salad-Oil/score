@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Guard against the encoding damage that Windows PowerShell quietly causes.
+
+This repository is written on Windows and read on Linux and GitHub. A PowerShell
+pipeline such as ``Get-Content -Raw x.md | Set-Content x.md -Encoding utf8``
+decodes UTF-8 as the machine's ANSI codepage (cp936/GBK on a Chinese Windows) and
+re-encodes the result, so every ``—`` becomes ``鈥?``, a BOM appears at the top of
+the file, and no tool reports an error. That happened once; this script is what
+stops it happening again.
+
+Two checks, both fatal:
+
+* **No UTF-8 BOM.** Markdown, YAML, Python and ``.example`` files in this repo
+  have never carried one, and Git for Windows tooling does not add them.
+* **No mojibake.** Characters are exhausted against an allowlist of scripts the
+  docs legitimately use (ASCII, Latin-1 punctuation, Greek for the σ/Δ maths,
+  CJK for the Chinese quick-start, and the fullwidth forms that section needs).
+  Anything outside those ranges -- a stray ``鈥``, a Private Use Area codepoint --
+  is a double-encoding artefact.
+
+Run standalone, from the pre-commit hook, or from CI::
+
+    python scripts/check_encoding.py            # whole repository
+    python scripts/check_encoding.py README.md  # specific paths
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+
+#: Extensions whose contents are text this repository authors itself.
+TEXT_SUFFIXES = {
+    ".md", ".py", ".yml", ".yaml", ".toml", ".json", ".csv", ".txt",
+    ".example", ".service", ".ps1", ".sh", ".cfg", ".ini",
+}
+
+BOM = b"\xef\xbb\xbf"
+
+#: Codepoint ranges the documents are allowed to contain.
+#:
+#: Deliberately generous inside each range and strict about the ranges: the point
+#: is to catch double-encoding, not to police which words the team may write.
+ALLOWED_RANGES = (
+    (0x0000, 0x007F),  # ASCII
+    (0x00A0, 0x00FF),  # Latin-1 supplement: ±, ×, ÷
+    (0x0391, 0x03C9),  # Greek: Δ, σ
+    (0x2010, 0x203A),  # general punctuation: – — ‘ ’ “ ” …
+    (0x20AC, 0x20AC),  # €
+    (0x2100, 0x2138),  # letterlike symbols: ℃, ™
+    (0x2190, 0x21FF),  # arrows
+    (0x2200, 0x22FF),  # mathematical operators: − ≤ ≥ ≠ ≡ ∓
+    (0x2460, 0x24FF),  # enclosed alphanumerics: ㈠ ㈡
+    (0x2500, 0x257F),  # box drawing
+    (0x25A0, 0x25FF),  # geometric shapes
+    (0x2600, 0x27BF),  # misc symbols and dingbats: ✓
+    (0x3000, 0x303F),  # CJK punctuation: 、。 「」
+    (0x3040, 0x30FF),  # hiragana / katakana (used as literal examples)
+    (0x4E00, 0x9FFF),  # CJK unified ideographs: the Chinese quick-start
+    (0xFF00, 0xFFEF),  # fullwidth forms: （） ， ：
+)
+
+
+def _allowed(ch: str) -> bool:
+    cp = ord(ch)
+    if cp in KNOWN_MOJIBAKE:
+        return False
+    return any(low <= cp <= high for low, high in ALLOWED_RANGES)
+
+
+#: Codepoints that only ever appeared in this repository as the result of a
+#: cp936 round trip, harvested from the real damage. An explicit blocklist rather
+#: than narrower CJK ranges on purpose: the docs legitimately contain Chinese, and
+#: so do code comments, so tightening the ideograph range would flag real text.
+#: These specific characters are the artefacts `—`, `–`, `→` and `≤` turn into
+#: when their UTF-8 bytes are read as GBK (the third byte is an incomplete
+#: sequence, which shifts the following bytes and yields CJK lookalikes).
+KNOWN_MOJIBAKE = frozenset(
+    {
+        0x20AC,  # € -- appeared in the damaged README
+        0x2103,  # ℃
+        0x3221,  # ㈡
+        0x300D,  # 」
+        0xFF45,  # ｅ
+        0xFFE0,  # ￠
+        0x9225,  # 鈥  <- the em dash artefact, the most common one
+        0x9286,  # 銆
+        0x951B,  # 锛
+        0x93C8,  # 鏈
+        0x93C9,  # 鏉
+        0x9428,  # 鐨
+        0x9429,  # 鐩
+        0x95BD,  # 閽
+        0x95C0,  # 闀
+        0x95C7,  # 闇
+        0x922D,  # 鈭
+        0x922E,  # 鈮
+        0x934A,  # 鍊
+        0x934F,  # 鍏
+        0x9350,  # 鍐
+        0x9351,  # 鍑
+        0x9358,  # 鍘
+        0x9359,  # 鍙
+        0x935A,  # 鍚
+        0x9365,  # 鍥
+        0x9366,  # 鍦
+        0x93B5,  # 鎵
+        0x93B7,  # 鎷
+        0x93B9,  # 鎹
+        0x93BA,  # 鎺
+        0x93BB,  # 鎻
+        0x93C1,  # 鏁
+        0x93C2,  # 鏂
+        0x93C3,  # 鏃
+        0x93C4,  # 鏄
+        0x93CD,  # 鏍
+        0x87FD,  # 蟽  <- the sigma artefact
+        *range(0xE000, 0xF900),  # private use area, written by the bad encoder
+    }
+)
+
+
+def _label(ch: str) -> str:
+    try:
+        return unicodedata.name(ch)
+    except ValueError:
+        return "<unnamed>"
+
+
+#: Files that legitimately quote the artefacts they detect, and so must be
+#: exempt from their own rule. `scan_secrets.py` needs the same exemption for its
+#: pattern list. Adding an entry here is a deliberate decision: it is a place a
+#: real re-encoding bug could hide.
+SELF_EXEMPT = frozenset({"scripts/check_encoding.py"})
+
+
+def _skip(path: Path) -> bool:
+    """Is this file exempt from the guard?"""
+    return path.as_posix() in SELF_EXEMPT
+
+
+def check_file(path: Path) -> list[str]:
+    """Return human-readable problems for one file (empty means clean)."""
+    problems: list[str] = []
+    if _skip(path):
+        return problems
+    raw = path.read_bytes()
+
+    if raw.startswith(BOM):
+        problems.append("starts with a UTF-8 BOM (this repo's files do not carry one)")
+
+    body = raw[3:] if raw.startswith(BOM) else raw
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        problems.append(f"is not valid UTF-8: {exc}")
+        return problems
+
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        offenders = [ch for ch in line if not _allowed(ch)]
+        if offenders:
+            seen: list[str] = []
+            for ch in offenders:
+                shown = f"U+{ord(ch):04X} {ch!r} ({_label(ch)})"
+                if shown not in seen:
+                    seen.append(shown)
+            problems.append(f"line {line_no}: unexpected character(s) {', '.join(seen[:4])}")
+            if len(problems) >= 6:
+                problems.append("... further problems suppressed")
+                break
+    return problems
+
+
+def tracked_text_files(paths: list[str]) -> list[Path]:
+    if paths:
+        return [Path(p) for p in paths]
+    listing = subprocess.run(["git", "ls-files"], capture_output=True, text=True).stdout.split()
+    return [Path(p) for p in listing if Path(p).suffix.lower() in TEXT_SUFFIXES]
+
+
+def main(argv: list[str]) -> int:
+    files = tracked_text_files(argv)
+    if not files:
+        print("no text files to check")
+        return 0
+
+    damaged = 0
+    for path in files:
+        if not path.is_file():
+            continue
+        problems = check_file(path)
+        if problems:
+            damaged += 1
+            print(f"{path}:")
+            for problem in problems:
+                print(f"    {problem}")
+
+    if damaged:
+        print()
+        print(f"FAILED: {damaged} of {len(files)} file(s) look re-encoded.")
+        print("A PowerShell pipe such as `Get-Content x | Set-Content x` does this.")
+        print("Rewrite the file from its original bytes and apply edits again.")
+        return 1
+
+    print(f"encoding OK: {len(files)} text file(s) are BOM-free UTF-8 with no mojibake")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

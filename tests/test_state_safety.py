@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import scan_secrets  # noqa: E402  (deliberately after the sys.path fix-up)
+import check_encoding  # noqa: E402  (same: it lives in scripts/)
 
 from roostoo.config import Config  # noqa: E402
 from roostoo.engine import TradingEngine  # noqa: E402
@@ -508,6 +509,83 @@ class TestDepthProviderSignsItsRequests(unittest.TestCase):
         provider = RoostooDepthProvider(UnsignedClient(), "/v3/depth", transport=transport, timeout=5.0)
         self.assertIsNotNone(provider.snapshot(PAIR, 0.005))
         self.assertNotIn("MSG-SIGNATURE", transport.calls[0][3])
+
+
+# ---------------------------------------------------------------------------
+class TestTextEncodingGuard(unittest.TestCase):
+    """A re-encoded file is still valid UTF-8, so nothing else catches this.
+
+    `Get-Content README.md | Set-Content README.md -Encoding utf8` in Windows
+    PowerShell decodes UTF-8 as the machine's ANSI codepage and re-encodes the
+    result: every em dash became a CJK lookalike (U+9225, among others) and a BOM
+    appeared at the top of the file. Every test passed, `compileall` passed, and
+    the damage was only visible as mojibake on GitHub. `scripts/check_encoding.py`
+    is the guard.
+    """
+
+    def test_the_real_repository_is_clean(self) -> None:
+        files = check_encoding.tracked_text_files([])
+        self.assertGreater(len(files), 10, "the guard found almost no files to check")
+        damaged = {str(p): check_encoding.check_file(p) for p in files if p.is_file()}
+        damaged = {name: problems for name, problems in damaged.items() if problems}
+        self.assertEqual(damaged, {}, f"these files are not clean UTF-8: {damaged}")
+
+    def test_a_bom_is_caught(self) -> None:
+        with scratch_dir() as d:
+            path = d / "bom.md"
+            path.write_bytes(b"\xef\xbb\xbf# Title\n")
+            problems = check_encoding.check_file(path)
+            self.assertTrue(any("BOM" in p for p in problems), problems)
+
+    def test_mojibake_is_caught(self) -> None:
+        with scratch_dir() as d:
+            path = d / "mojibake.md"
+            # Exactly what a cp936 round trip did to "Rules 1-3 -- the entry logic":
+            # U+9225 is the em dash artefact, U+951B the fullwidth-colon artefact.
+            path.write_text("Rules 1\u92252\u2014the entry \u951b\u9286 logic\n", encoding="utf-8")
+            problems = check_encoding.check_file(path)
+            self.assertTrue(problems, "a cp936 artefact was accepted")
+
+    def test_the_sigma_artefact_is_caught(self) -> None:
+        """A cp936 misread of a 2-byte UTF-8 sequence lands inside the CJK range."""
+        with scratch_dir() as d:
+            path = d / "sigma.md"
+            path.write_text("Z = \u87fd\n", encoding="utf-8")
+            self.assertTrue(check_encoding.check_file(path))
+
+    def test_a_private_use_character_is_caught(self) -> None:
+        with scratch_dir() as d:
+            path = d / "pua.md"
+            path.write_text("value \ue0a2 table\n", encoding="utf-8")
+            self.assertTrue(check_encoding.check_file(path))
+
+    def test_legitimate_content_is_not_flagged(self) -> None:
+        """The guard must not police the languages the docs legitimately use."""
+        with scratch_dir() as d:
+            path = d / "good.md"
+            path.write_text(
+                "# Title \u2014 with an em dash\n"
+                "Z \u2264 \u22122\u03c3 and \u00b10.5% and \u0394Z > 0\n"
+                "## 8. \u4e2d\u6587\u5feb\u901f\u5f00\u59cb\n"
+                "\u65e0\u5bc6\u94a5\u5148\u8dd1\u901a\u6574\u6761\u94fe\u8def\uff08\u5185\u7f6e\u6a21\u62df\u4ea4\u6613\u6240\uff09\n"
+                "| exit | n | \u00b1\u2014\u2264\u2265 |\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(check_encoding.check_file(path), [])
+
+    def test_ci_runs_the_guard(self) -> None:
+        workflow = (Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("scripts/check_encoding.py", workflow)
+
+    def test_the_guard_exempts_only_itself(self) -> None:
+        """It quotes the artefacts it detects, so it must skip its own file -- and
+        nothing else. Every entry here is a place a real bug could hide."""
+        self.assertEqual(check_encoding.SELF_EXEMPT, {"scripts/check_encoding.py"})
+        self.assertTrue(check_encoding._skip(Path("scripts/check_encoding.py")))
+        self.assertFalse(check_encoding._skip(Path("README.md")))
+        self.assertFalse(check_encoding._skip(Path("scripts/scan_secrets.py")))
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,15 @@ jobs:
       - name: Byte-compile every module
         run: python -m compileall -q roostoo tests run_live.py run_backtest.py run_sweep.py scripts
 
+      # A PowerShell pipeline (`Get-Content x | Set-Content x -Encoding utf8`)
+      # re-encodes UTF-8 as the machine's ANSI codepage and silently replaces every
+      # em dash with CJK lookalikes (the common one is U+9225), adding a BOM.
+      # Nothing else notices: the file is still valid UTF-8, every test passes, and
+      # the damage only shows up as mojibake on GitHub. That happened once, to
+      # README.md, CONTRIBUTING.md and docs/FINDINGS.md, so it is checked in CI now.
+      - name: Text files are BOM-free UTF-8 with no mojibake
+        run: python scripts/check_encoding.py
+
       - name: Configuration rejects a missing key
         run: |
           if python -c "from roostoo.config import Config; Config.from_env({})"; then
