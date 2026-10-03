@@ -242,14 +242,23 @@ class OrderResult:
 
     @classmethod
     def from_api(cls, pair: str, side: str, order_type: str, qty: float, raw: dict[str, Any]) -> "OrderResult":
+        """Normalise an API payload.
+
+        An absent ``Status`` must NOT be read as ``FILLED``. That default is what
+        let a history row with no status -- and ``FilledQuantity=0`` -- reach the
+        execution path as a completed fill, which then booked a full-size
+        position at price zero. Unstated means unknown, and the execution layer
+        refuses to act on an unknown or unfilled order.
+        """
         detail = raw.get("OrderDetail") or {}
+        status = str(detail.get("Status", "") or "").strip().upper() or "UNKNOWN"
         return cls(
             pair=str(detail.get("Pair", pair)),
             side=str(detail.get("Side", side)),
             order_type=str(detail.get("Type", order_type)),
             quantity=float(detail.get("Quantity", qty) or qty),
             price=float(detail.get("Price", 0.0) or 0.0),
-            status=str(detail.get("Status", "FILLED")),
+            status=status,
             order_id=int(detail["OrderID"]) if detail.get("OrderID") is not None else None,
             filled_quantity=float(detail.get("FilledQuantity", 0.0) or 0.0),
             avg_fill_price=float(detail.get("FilledAverPrice", 0.0) or 0.0),

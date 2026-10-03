@@ -100,14 +100,22 @@ class BasisRow:
     def exceeds(self, threshold_pct: float) -> bool:
         return self.basis_pct is not None and abs(self.basis_pct) > threshold_pct
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, threshold_pct: Optional[float] = None) -> dict[str, Any]:
+        """Serialise the row. ``exceeds`` needs the threshold to mean anything.
+
+        It used to be ``basis_pct != 0.0``, which ignored the tolerance entirely:
+        a pair off by 1e-7 was journalled as ``"exceeds": true`` while
+        ``BasisReport.blocked()`` -- which does apply the threshold -- happily
+        kept trading it. The audit trail and the decision disagreed.
+        """
+        threshold = DEFAULT_BASIS_MAX_PCT if threshold_pct is None else threshold_pct
         return {
             "pair": self.pair,
             "reference": self.reference_symbol,
             "venue_mid": round(self.venue_mid, 8),
             "reference_price": None if self.reference_price is None else round(self.reference_price, 8),
             "basis_pct": None if self.basis_pct is None else round(self.basis_pct, 6),
-            "exceeds": self.basis_pct is not None and self.basis_pct != 0.0,
+            "exceeds": self.exceeds(threshold),
         }
 
 
@@ -145,7 +153,7 @@ class BasisReport:
             "blocked": sorted(self.blocked()),
             "unverified": sorted(self.unverified),
             "worst": None if worst is None else {"pair": worst.pair, "basis_pct": round(worst.basis_pct or 0.0, 6)},
-            "rows": {pair: row.to_dict() for pair, row in self.rows.items()},
+            "rows": {pair: row.to_dict(self.threshold_pct) for pair, row in self.rows.items()},
         }
 
     def summary(self) -> str:

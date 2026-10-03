@@ -18,7 +18,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .client import PATH_PLACE_ORDER
 from .config import Config
+from .errors import APIError
 from .models import (
     ExchangeInfo,
     OrderResult,
@@ -259,11 +261,16 @@ class MockRoostooClient:
         self._order_seq += 1
 
         if spec is None:
-            return self._reject(pair, side, order_type, qty, "pair not found")
+            self._fail(pair, "pair not found")
         if qty <= 0:
-            return self._reject(pair, side, order_type, qty, "quantity must be positive", order_id)
+            self._fail(pair, "quantity must be positive")
         if order_type == "LIMIT" and price is None:
-            return self._reject(pair, side, order_type, qty, "limit order requires a price", order_id)
+            self._fail(pair, "limit order requires a price")
+        # The venue refuses orders below the pair's MiniOrder. Not modelling it
+        # meant the engine's long-path `_quantise` check was the only guard and
+        # `--mock` happily accepted sizes the real venue rejects.
+        if spec.min_order and qty * (float(price) if order_type == "LIMIT" and price else spec.price) < spec.min_order:
+            self._fail(pair, "order value below MiniOrder")
 
         bid, ask = self._quote(spec)
         limit_price = float(price) if price is not None else 0.0
@@ -279,12 +286,12 @@ class MockRoostooClient:
         if side == "BUY":
             need = qty * limit_price
             if self._free("USD") < need:
-                return self._reject(pair, side, order_type, qty, "insufficient balance", order_id, limit_price)
+                self._fail(pair, "insufficient balance")
             self._lock("USD", need)
             locked_asset, locked_amount = "USD", need
         else:
             if self._free(spec.coin) < qty:
-                return self._reject(pair, side, order_type, qty, "insufficient balance", order_id, limit_price)
+                self._fail(pair, "insufficient balance")
             self._lock(spec.coin, qty)
             locked_asset, locked_amount = spec.coin, qty
 
@@ -322,7 +329,7 @@ class MockRoostooClient:
         fill_price = fill_price + slip if side == "BUY" else max(fill_price - slip, 0.0)
         ok, err = self._execute(side, spec.pair, qty, fill_price, role, order_id)
         if not ok:
-            return self._reject(spec.pair, side, "MARKET", qty, err, order_id, fill_price)
+            self._fail(spec.pair, err)
         return OrderResult.from_api(
             spec.pair, side, "MARKET", qty, {"Success": True, "ErrMsg": "", "OrderDetail": self._orders[-1]}
         )
@@ -364,26 +371,17 @@ class MockRoostooClient:
         )
         return True, ""
 
-    def _reject(
-        self,
-        pair: str,
-        side: str,
-        order_type: str,
-        qty: float,
-        err: str,
-        order_id: Optional[int] = None,
-        price: float = 0.0,
-    ) -> OrderResult:
-        return OrderResult(
-            pair=pair,
-            side=side,
-            order_type=order_type,
-            quantity=qty,
-            price=price,
-            status="REJECTED",
-            order_id=order_id,
-            err_msg=err,
-        )
+    def _fail(self, pair: str, err: str) -> None:
+        """Raise the same error the live client raises for a rejection.
+
+        The live client turns `Success: false` into an `APIError`. The simulator
+        used to *return* an `OrderResult(status="REJECTED")` instead, so the
+        engine's `status == "REJECTED"` branch was exercised only under `--mock`
+        and live rejections took a completely different path (caught by the broad
+        handler in `_execute`). A mock that does not fail the way the venue fails
+        is worse than no mock.
+        """
+        raise APIError(err, PATH_PLACE_ORDER, {"Success": False, "ErrMsg": err})
 
     @staticmethod
     def _detail(
@@ -599,13 +597,22 @@ class MockRoostooClient:
 
     # -- test conveniences ---------------------------------------------
     def equity(self) -> float:
-        """Mark-to-market account value, used by the offline integration test."""
+        """Mark-to-market account value, matching `risk.portfolio_nav`.
+
+        Two corrections over the previous formula. The locked USD is *included*
+        (short collateral stays on the books at face value while its P&L floats),
+        and the coin rows are valued as holdings which is what they are. The old
+        version started from `free` USD only -- excluding the locked collateral --
+        and then added that same collateral back, so a posted short collateral was
+        counted twice and equity read roughly 10% high.
+        """
         self._step()
-        total = self._free("USD")
+        total = self._free("USD") + self._lock_balance("USD")
         for spec in self._specs.values():
             book = self._wallet[spec.coin]
             total += (book["free"] + book["lock"]) * spec.price
-        shorts = self.short_positions()
-        total += sum(p.unrealized_pnl for p in shorts)
-        total += sum(p.collateral for p in shorts)
+        total += sum(p.unrealized_pnl for p in self.short_positions())
         return total
+
+    def _lock_balance(self, asset: str) -> float:
+        return self._wallet[asset]["lock"]

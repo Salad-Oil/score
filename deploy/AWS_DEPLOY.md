@@ -128,6 +128,14 @@ python3 -c "from roostoo.journal import read_events; print(len(read_events('jour
   position book and risk state are restored from `journal/`, so a restart does not
   lose stops or cooldowns.
 * **Emergency stop that keeps positions:** `sudo systemctl stop roostoo-bot`.
+* **The kill switch halting is normal, not a crash.** When `MAX_DRAWDOWN_PCT` is
+  breached the bot flattens, persists `halted: true` and exits with status `3`,
+  which the unit declares a clean stop (`SuccessExitStatus=3`) so
+  `Restart=always` does not restart it. `systemctl status` will say
+  `inactive (dead)` and the journal contains the halt reason. Restarting cannot
+  help -- clear it by setting `"halted": false` in `journal/engine_state.json`,
+  and only after understanding why the drawdown happened. A genuine crash exits
+  with any other status and is still restarted.
 * **Emergency stop that closes the book:** stop the service FIRST, then flatten.
   Running it while the unit is up leaves two writers on the same account and the
   same `journal/*.tmp` files. Also note that `--cycles 1` still runs one full

@@ -329,8 +329,29 @@ class TestOrderResultFallbacks(unittest.TestCase):
         self.assertEqual(result.side, "SELL")
         self.assertEqual(result.order_type, "MARKET")
         self.assertAlmostEqual(result.quantity, 2.0)
-        self.assertEqual(result.status, "FILLED")
         self.assertIsNone(result.order_id)
+
+    def test_a_missing_status_is_unknown_never_filled(self) -> None:
+        """Unstated status must not be read as a completed fill.
+
+        Defaulting to FILLED meant a history row with no Status -- and
+        FilledQuantity 0 -- reached the execution path as a full-size fill, which
+        booked a phantom position at price zero and wrote it to positions.json.
+        """
+        result = OrderResult.from_api("ETH/USD", "SELL", "MARKET", 2.0, {"Success": True})
+        self.assertEqual(result.status, "UNKNOWN")
+        self.assertFalse(result.is_live)
+
+        blank = OrderResult.from_api(
+            "ETH/USD", "SELL", "MARKET", 2.0, {"Success": True, "OrderDetail": {"Status": ""}}
+        )
+        self.assertEqual(blank.status, "UNKNOWN")
+
+    def test_lowercase_status_is_normalised(self) -> None:
+        result = OrderResult.from_api(
+            "ETH/USD", "SELL", "MARKET", 2.0, {"Success": True, "OrderDetail": {"Status": "filled"}}
+        )
+        self.assertEqual(result.status, "FILLED")
 
     def test_rejected_status_is_not_live(self) -> None:
         result = OrderResult(

@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
 from typing import Iterator
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -35,12 +38,20 @@ from roostoo.config import Config  # noqa: E402
 from roostoo.engine import TradingEngine  # noqa: E402
 from roostoo.models import (  # noqa: E402
     ExchangeInfo,
+    OrderResult,
     Position,
+    ShortPosition,
     Ticker,
     TradePair,
     WalletBalance,
 )
-from roostoo.risk import PortfolioView, PositionBook, PositionSizer, RiskManager  # noqa: E402
+from roostoo.risk import (  # noqa: E402
+    ApprovedAction,
+    PortfolioView,
+    PositionBook,
+    PositionSizer,
+    RiskManager,
+)
 from roostoo.strategies.base import ENTER_LONG, EXIT_LONG, Signal  # noqa: E402
 from roostoo.universe import RoostooDepthProvider  # noqa: E402
 
@@ -544,6 +555,399 @@ class TestSecretScanner(unittest.TestCase):
         """It contains the word `secret` and a PEM header; it must skip itself."""
         self.assertTrue(scan_secrets._skip("scripts/scan_secrets.py"))
         self.assertEqual(scan_secrets.scan_worktree(), [])
+
+
+# ---------------------------------------------------------------------------
+# State safety, round two. Every case here is a bug that shipped: a transient
+# error that deleted live positions, an absent balance row read as "flat", a
+# history row with no status read as a fill, and a malformed state file that
+# stopped the bot from starting at all.
+# ---------------------------------------------------------------------------
+
+
+class _StatefulClient:
+    """Minimal client whose failure modes are set per test."""
+
+    def __init__(self, short_rows: list | None = None, order_rows: list | None = None) -> None:
+        self._short_rows = short_rows if short_rows is not None else []
+        self._order_rows = order_rows if order_rows is not None else []
+        self.short_positions_raises = False
+        self.orders_placed: list[tuple] = []
+
+    def sync_time(self) -> int:
+        return 0
+
+    def exchange_info(self) -> ExchangeInfo:
+        return ExchangeInfo(pairs={PAIR: trade_pair()}, is_running=True, initial_wallet=100_000.0)
+
+    def ticker(self, pair: str | None = None) -> dict:
+        return {PAIR: ticker(PAIR)}
+
+    def balance(self) -> dict:
+        return {"USD": WalletBalance(asset="USD", free=100_000.0, locked=0.0)}
+
+    def pending_count(self) -> tuple[int, dict]:
+        return 0, {}
+
+    def place_order(self, pair, side, qty, order_type="MARKET", price=None):
+        self.orders_placed.append((pair, side, qty))
+        return OrderResult(
+            pair=pair,
+            side=side,
+            order_type=order_type,
+            quantity=float(qty),
+            price=0.0,
+            status="FILLED",
+            filled_quantity=float(qty),
+            avg_fill_price=60_000.0,
+        )
+
+    def query_orders(self, **kwargs) -> list:
+        return list(self._order_rows)
+
+    def cancel_order(self, *args, **kwargs) -> list:
+        return []
+
+    def short_positions(self) -> list:
+        if self.short_positions_raises:
+            raise RuntimeError("simulated transient failure")
+        return list(self._short_rows)
+
+
+def make_engine(directory: Path, client) -> TradingEngine:
+    engine = TradingEngine(make_config(directory), client=client)
+    engine.exchange_pairs = {PAIR: trade_pair()}
+    return engine
+
+
+class TestUnknownOrderReconciliationDoesNotInventFills(unittest.TestCase):
+    """`_reconcile_unknown_order` had zero test coverage and matched on recency."""
+
+    def _action(self) -> ApprovedAction:
+        return ApprovedAction(pair=PAIR, action=ENTER_LONG, quantity=0.5, notional=50.0, reason="test")
+
+    def _unknown(self) -> OrderResult:
+        return OrderResult(
+            pair=PAIR, side="BUY", order_type="MARKET", quantity=0.5, price=0.0, status="UNKNOWN", err_msg="timeout"
+        )
+
+    def _row(self, **overrides) -> dict:
+        row = {
+            "CreateTimestamp": int(time.time() * 1000) - 1_000,
+            "Side": "BUY",
+            "Status": "FILLED",
+            "Quantity": 0.5,
+            "FilledQuantity": 0.5,
+            "FilledAverPrice": 60_100.0,
+            "OrderID": 7,
+        }
+        row.update(overrides)
+        return row
+
+    def test_a_genuine_fill_is_still_recognised(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(order_rows=[self._row()]))
+            self.addCleanup(engine.journal.close)
+            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+            position = engine.book.get(PAIR)
+            self.assertIsNotNone(position, "a real fill must still be booked")
+            self.assertAlmostEqual(position.quantity, 0.5)
+            self.assertAlmostEqual(position.avg_price, 60_100.0)
+
+    def test_a_row_with_no_status_is_not_a_fill(self) -> None:
+        """The row that used to become a 7.0-unit position at price zero."""
+        row = self._row()
+        del row["Status"]
+        row["Quantity"] = 7.0
+        row["FilledQuantity"] = 0.0
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(order_rows=[row]))
+            self.addCleanup(engine.journal.close)
+            self.assertIsNone(engine._reconcile_unknown_order(self._action(), self._unknown(), int(time.time() * 1000)))
+            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+            self.assertEqual(engine.book.positions, {}, "a row with no Status produced a phantom position")
+
+    def test_a_cancelled_row_of_another_size_is_not_ours(self) -> None:
+        row = self._row(Status="CANCELED", Quantity=999.0, FilledQuantity=0.0)
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(order_rows=[row]))
+            self.addCleanup(engine.journal.close)
+            self.assertIsNone(engine._reconcile_unknown_order(self._action(), self._unknown(), int(time.time() * 1000)))
+
+    def test_a_filled_status_with_no_quantity_is_not_booked(self) -> None:
+        row = self._row(FilledQuantity=0.0)
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(order_rows=[row]))
+            self.addCleanup(engine.journal.close)
+            engine._record_result(self._unknown(), self._action(), int(time.time() * 1000), 1)
+            self.assertEqual(engine.book.positions, {}, "FILLED with nothing filled was booked anyway")
+
+
+class TestShortPositionsSurviveATransientError(unittest.TestCase):
+    def test_a_failed_query_does_not_delete_the_books_shorts(self) -> None:
+        with scratch_dir() as d:
+            client = _StatefulClient()
+            client.short_positions_raises = True
+            engine = make_engine(d, client)
+            self.addCleanup(engine.journal.close)
+            engine.book.positions[PAIR] = Position(
+                pair=PAIR, is_short=True, quantity=0.5, avg_price=100.0, collateral=50.0, stop_price=110.0
+            )
+            self.assertIsNone(engine._safe_short_positions(), "an unanswered query must not read as 'no shorts'")
+            engine._reconcile_positions({"USD": WalletBalance(asset="USD", free=90_000.0, locked=0.0)}, None)
+            self.assertIn(PAIR, engine.book.positions, "a transient error deleted a live short")
+
+    def test_a_real_short_at_the_venue_is_adopted(self) -> None:
+        """An unbooked short used to be invisible to NAV and every cap."""
+        row = ShortPosition(
+            position_id=1,
+            pair=PAIR,
+            entry_price=100.0,
+            quantity=0.5,
+            collateral=50.0,
+            current_price=100.0,
+            unrealized_pnl=0.0,
+            unrealized_pct=0.0,
+            position_value=50.0,
+            created_ts_ms=1,
+        )
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient(short_rows=[row]))
+            self.addCleanup(engine.journal.close)
+            engine._reconcile_positions({"USD": WalletBalance(asset="USD", free=90_000.0, locked=0.0)}, [row])
+            position = engine.book.get(PAIR)
+            self.assertIsNotNone(position, "a short the venue reports must be booked")
+            self.assertTrue(position.is_short)
+            self.assertAlmostEqual(position.quantity, 0.5)
+
+    def test_a_confirmed_empty_answer_still_closes_the_book_short(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine.book.positions[PAIR] = Position(pair=PAIR, is_short=True, quantity=0.5, avg_price=100.0)
+            engine._reconcile_positions({"USD": WalletBalance(asset="USD", free=90_000.0, locked=0.0)}, [])
+            self.assertNotIn(PAIR, engine.book.positions)
+
+
+class TestAbsentBalanceRowIsNotAClose(unittest.TestCase):
+    def test_a_missing_coin_row_keeps_the_position(self) -> None:
+        """USD present and the coin row gone: the old guard waved this through."""
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine.book.positions[PAIR] = Position(
+                pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=61_000.0, stop_price=57_000.0
+            )
+            engine._reconcile_positions({"USD": WalletBalance(asset="USD", free=90_000.0, locked=0.0)}, [])
+            self.assertIn(PAIR, engine.book.positions, "an absent row deleted the whole book")
+            self.assertEqual(engine.book.positions[PAIR].stop_price, 57_000.0)
+
+    def test_an_explicit_zero_row_still_closes_it(self) -> None:
+        with scratch_dir() as d:
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine.book.positions[PAIR] = Position(pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=61_000.0)
+            engine._reconcile_positions(
+                {
+                    "USD": WalletBalance(asset="USD", free=90_000.0, locked=0.0),
+                    "BTC": WalletBalance(asset="BTC", free=0.0, locked=0.0),
+                },
+                [],
+            )
+            self.assertNotIn(PAIR, engine.book.positions)
+
+
+class TestAStopCannotSilentlyVanish(unittest.TestCase):
+    def test_a_non_finite_atr_refuses_the_entry(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        sizer = PositionSizer(cfg)
+        sizing = sizer.size(nav=100_000.0, price=101.0, atr=float("nan"))
+        self.assertEqual(sizing.notional, 0.0)
+        self.assertIsNone(sizing.stop_price)
+        self.assertEqual(sizing.binding, "no_stop_available")
+
+    def test_a_healthy_atr_still_sizes_and_sets_a_stop(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        sizing = PositionSizer(cfg).size(nav=100_000.0, price=101.0, atr=2.0)
+        self.assertGreater(sizing.notional, 0.0)
+        self.assertIsNotNone(sizing.stop_price)
+
+    def test_a_nan_mark_cannot_produce_a_stop_either(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        sizing = PositionSizer(cfg).size(nav=100_000.0, price=101.0, atr=float("inf"))
+        self.assertEqual(sizing.notional, 0.0)
+
+    def test_a_nan_price_is_never_accepted(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        sizing = PositionSizer(cfg).size(nav=100_000.0, price=float("nan"), atr=2.0)
+        self.assertEqual(sizing.notional, 0.0)
+
+
+class TestAnUnpriceablePositionCanStillBeExited(unittest.TestCase):
+    def test_the_time_stop_fires_without_a_usable_mark(self) -> None:
+        """The mark check used to sit in front of Rule 6, stranding the position."""
+        cfg = make_config(Path(tempfile.gettempdir()))
+        risk = RiskManager(cfg, PositionSizer(cfg))
+        position = Position(pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=0.0, opened_ts_ms=1_000_000)
+        signals = risk.protective_exits({PAIR: position}, {}, 1_800_000_000_000)
+        self.assertTrue(
+            any(s.meta.get("trigger") == "time_stop" for s in signals),
+            f"a position with no mark must still reach the time stop, got {[s.meta for s in signals]}",
+        )
+
+    def test_the_execution_layer_sells_it_anyway(self) -> None:
+        with scratch_dir() as d:
+            client = _StatefulClient()
+            engine = make_engine(d, client)
+            self.addCleanup(engine.journal.close)
+            engine.book.positions[PAIR] = Position(pair=PAIR, quantity=0.5, avg_price=60_000.0, mark_price=0.0)
+            engine._exit_long(
+                ApprovedAction(pair=PAIR, action=EXIT_LONG, quantity=0.5, notional=30_000.0, reason="flatten"),
+                int(time.time() * 1000),
+                1,
+            )
+            self.assertEqual(len(client.orders_placed), 1, "an unpriceable position could not be sold")
+            self.assertEqual(client.orders_placed[0][1], "SELL")
+
+
+class TestNonFiniteNavCannotDisableTheHalts(unittest.TestCase):
+    def test_a_nan_first_observation_leaves_the_kill_switch_armed(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        risk = RiskManager(cfg, PositionSizer(cfg))
+        risk.observe(float("nan"), 1_800_000_000_000)
+        self.assertTrue(math.isfinite(risk.peak_nav), "a NaN NAV poisoned the drawdown high-water mark")
+        self.assertEqual(risk.peak_nav, 0.0)
+
+    def test_a_nan_cannot_erase_a_real_high_water_mark(self) -> None:
+        """The poisoning that mattered: a good peak, then a NaN, then the crash.
+
+        `max(nan, x)` is NaN for every x and `nan <= 0` is False, so one non-finite
+        mark used to make `peak_nav` NaN and the `if self.peak_nav > 0` guard false
+        for the rest of the run -- the permanent kill switch simply stopped
+        existing.
+        """
+        cfg = make_config(Path(tempfile.gettempdir()))
+        risk = RiskManager(cfg, PositionSizer(cfg))
+        risk.observe(100_000.0, 1_800_000_000_000)
+        risk.observe(float("nan"), 1_800_000_000_000)
+        self.assertTrue(math.isfinite(risk.peak_nav))
+        self.assertAlmostEqual(risk.peak_nav, 100_000.0)
+        risk.observe(1.0, 1_800_000_000_000)
+        self.assertTrue(risk.halted, "a 99.999% drawdown did not trip the kill switch")
+
+    def test_a_non_positive_nav_halts(self) -> None:
+        cfg = make_config(Path(tempfile.gettempdir()))
+        risk = RiskManager(cfg, PositionSizer(cfg))
+        risk.observe(0.0, 1_800_000_000_000)
+        self.assertTrue(risk.halted)
+
+
+class TestMalformedStateCannotStopTheBoot(unittest.TestCase):
+    def test_a_wrong_type_in_the_risk_state_is_ignored(self) -> None:
+        with scratch_dir() as d:
+            (d / "engine_state.json").write_text(
+                json.dumps({"risk": {"peak_nav": "not-a-number", "last_exit_bar": {"ETH/USD": None}}}),
+                encoding="utf-8",
+            )
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine._load_risk_state()  # must not raise
+            self.assertEqual(engine.risk.peak_nav, 0.0)
+            self.assertEqual(engine.risk.last_exit_bar, {})
+
+    def test_a_non_object_state_payload_is_ignored(self) -> None:
+        with scratch_dir() as d:
+            (d / "engine_state.json").write_text("[]", encoding="utf-8")
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            engine._load_risk_state()
+            self.assertEqual(engine.risk.peak_nav, 0.0)
+
+    def test_a_bad_position_row_does_not_cost_the_good_ones(self) -> None:
+        with scratch_dir() as d:
+            (d / "positions.json").write_text(
+                json.dumps(
+                    {
+                        "positions": {
+                            PAIR: {"quantity": None, "stop_price": "abc"},
+                            "ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": 1.5},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            self.assertTrue(engine.book.load())
+            self.assertNotIn(PAIR, engine.book.positions, "an empty row was restored as a position")
+            restored = engine.book.get("ETH/USD")
+            self.assertIsNotNone(restored, "one bad row cost us the good one")
+            self.assertEqual(restored.stop_price, 1.5)
+
+    def test_a_non_numeric_stop_level_is_dropped_not_kept_as_a_string(self) -> None:
+        with scratch_dir() as d:
+            (d / "positions.json").write_text(
+                json.dumps({"positions": {"ETH/USD": {"quantity": 1.0, "avg_price": 2.0, "stop_price": "abc"}}}),
+                encoding="utf-8",
+            )
+            engine = make_engine(d, _StatefulClient())
+            self.addCleanup(engine.journal.close)
+            self.assertTrue(engine.book.load())
+            position = engine.book.get("ETH/USD")
+            self.assertIsNotNone(position)
+            self.assertIsNone(position.stop_price, "a string stop level survived into the book")
+
+
+class TestAHaltedRunStopsCleanlyInsteadOfRestarting(unittest.TestCase):
+    """`Restart=always` used to restart a deliberately halted bot ~10 times.
+
+    The halt is persisted, so a restart cannot recover anything. `run_live.py` now
+    exits with a distinct status that the systemd unit declares a success, so the
+    unit stops rather than thrashing.
+    """
+
+    def test_the_halt_status_is_distinct_from_success_and_failure(self) -> None:
+        import run_live
+
+        self.assertEqual(run_live.HALTED_EXIT_STATUS, 3)
+        self.assertNotIn(run_live.HALTED_EXIT_STATUS, (0, 1))
+
+    def test_the_unit_declares_that_status_a_clean_stop(self) -> None:
+        import run_live
+
+        unit = (Path(__file__).resolve().parent.parent / "deploy" / "roostoo-bot.service").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"SuccessExitStatus={run_live.HALTED_EXIT_STATUS}", unit)
+        self.assertIn("Restart=always", unit)
+
+    def test_a_halted_run_returns_the_halt_status(self) -> None:
+        import run_live
+
+        with scratch_dir() as d:
+            env = d / ".env"
+            env.write_text("ROOSTOO_MOCK=1\nJOURNAL_DIR=%s\nLOG_DIR=%s\n" % (d, d), encoding="utf-8")
+
+            captured: dict = {}
+            real_build = run_live.build_engine
+
+            def build(cfg, seed, data_dir, interval):
+                engine = real_build(cfg, seed, data_dir, interval)
+                captured["engine"] = engine
+
+                def fake_run(max_cycles=None):
+                    engine.risk.halted = True
+                    engine.risk.halt_reason = "drawdown 25.00% >= 20.00% of peak NAV"
+                    return engine.stats
+
+                engine.run = fake_run  # type: ignore[method-assign]
+                return engine
+
+            with mock.patch.object(run_live, "build_engine", build):
+                status = run_live.main(["--mock", "--env", str(env), "--no-seed", "--log-level", "ERROR"])
+
+            self.assertEqual(status, run_live.HALTED_EXIT_STATUS, "a halted run must not report success")
+            captured["engine"].journal.close()
 
 
 if __name__ == "__main__":

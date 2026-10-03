@@ -22,6 +22,7 @@ import unittest
 
 import roostoo.simulator as simulator
 from roostoo.config import Config
+from roostoo.errors import APIError
 from roostoo.models import ExchangeInfo, OrderResult
 from roostoo.simulator import MockRoostooClient
 
@@ -140,15 +141,23 @@ class TestMarketBuy(SimulatorTestCase):
         self.assertEqual(result.role, "TAKER")
 
     def test_market_buy_beyond_the_balance_is_rejected(self) -> None:
+        """A rejection raises, exactly as the live client does.
+
+        The live client converts `Success: false` into an `APIError`; the
+        simulator used to return `status="REJECTED"` instead, so the engine's
+        rejection branch was exercised only under `--mock` and live rejections
+        took a different path entirely.
+        """
         client = make_client(initial_capital=1_000.0)
-        result = client.place_order(STABLE_PAIR, "BUY", 1_000.0, order_type="MARKET")
-        self.assertEqual(result.status, "REJECTED")
-        self.assertIn("insufficient balance", result.err_msg)
+        with self.assertRaises(APIError) as caught:
+            client.place_order(STABLE_PAIR, "BUY", 1_000.0, order_type="MARKET")
+        self.assertIn("insufficient balance", str(caught.exception))
 
     def test_rejected_market_buy_leaves_the_balance_untouched(self) -> None:
         client = make_client(initial_capital=1_000.0)
         before = free_usd(client)
-        client.place_order(STABLE_PAIR, "BUY", 1_000.0, order_type="MARKET")
+        with self.assertRaises(APIError):
+            client.place_order(STABLE_PAIR, "BUY", 1_000.0, order_type="MARKET")
         self.assertAlmostEqual(free_usd(client), before, places=9)
 
 
@@ -156,17 +165,17 @@ class TestMarketSellRejection(SimulatorTestCase):
     def test_selling_more_than_the_free_balance_is_rejected(self) -> None:
         """No holdings at all, so any SELL above zero must be refused."""
         client = make_client()
-        result = client.place_order(STABLE_PAIR, "SELL", 1.0, order_type="MARKET")
-        self.assertEqual(result.status, "REJECTED")
-        self.assertIn("insufficient balance", result.err_msg)
+        with self.assertRaises(APIError) as caught:
+            client.place_order(STABLE_PAIR, "SELL", 1.0, order_type="MARKET")
+        self.assertIn("insufficient balance", str(caught.exception))
 
     def test_selling_slightly_more_than_held_is_rejected(self) -> None:
         """Owning 0.5 and selling 0.51 must be refused."""
         client = make_client()
         client.place_order(STABLE_PAIR, "BUY", 0.5, order_type="MARKET")
-        result = client.place_order(STABLE_PAIR, "SELL", 0.51, order_type="MARKET")
-        self.assertEqual(result.status, "REJECTED")
-        self.assertIn("insufficient balance", result.err_msg)
+        with self.assertRaises(APIError) as caught:
+            client.place_order(STABLE_PAIR, "SELL", 0.51, order_type="MARKET")
+        self.assertIn("insufficient balance", str(caught.exception))
 
     def test_selling_exactly_the_free_balance_is_accepted(self) -> None:
         """The boundary case: the whole holding is sellable."""
@@ -179,14 +188,27 @@ class TestMarketSellRejection(SimulatorTestCase):
         client = make_client()
         client.place_order(STABLE_PAIR, "BUY", 0.5, order_type="MARKET")
         before = client.balance()["BTC"].free
-        client.place_order(STABLE_PAIR, "SELL", 5.0, order_type="MARKET")
+        with self.assertRaises(APIError):
+            client.place_order(STABLE_PAIR, "SELL", 5.0, order_type="MARKET")
         self.assertAlmostEqual(client.balance()["BTC"].free, before, places=9)
 
     def test_sell_of_an_unknown_pair_is_rejected(self) -> None:
         client = make_client()
-        result = client.place_order("NOPE/USD", "BUY", 1.0, order_type="MARKET")
-        self.assertEqual(result.status, "REJECTED")
-        self.assertIn("pair not found", result.err_msg)
+        with self.assertRaises(APIError) as caught:
+            client.place_order("NOPE/USD", "BUY", 1.0, order_type="MARKET")
+        self.assertIn("pair not found", str(caught.exception))
+
+    def test_an_order_below_the_pair_minimum_is_rejected(self) -> None:
+        """The venue enforces `MiniOrder`; the mock must too.
+
+        Without this the simulator filled sizes the real venue refuses, so the
+        only guard was the engine's long-path `_quantise` and `--mock` looked
+        healthy for orders that could never be placed.
+        """
+        client = make_client()
+        with self.assertRaises(APIError) as caught:
+            client.place_order(STABLE_PAIR, "BUY", 0.000001, order_type="MARKET")
+        self.assertIn("MiniOrder", str(caught.exception))
 
 
 class TestRestingLimitOrder(SimulatorTestCase):
@@ -249,8 +271,9 @@ class TestRestingLimitOrder(SimulatorTestCase):
 
     def test_limit_buy_without_a_price_is_rejected(self) -> None:
         client = make_client()
-        result = client.place_order(STABLE_PAIR, "BUY", 1.0, order_type="LIMIT")
-        self.assertEqual(result.status, "REJECTED")
+        with self.assertRaises(APIError) as caught:
+            client.place_order(STABLE_PAIR, "BUY", 1.0, order_type="LIMIT")
+        self.assertIn("price", str(caught.exception))
 
     def test_crossing_limit_buy_fills_as_taker(self) -> None:
         """A bid at or above the ask crosses and fills immediately."""

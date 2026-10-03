@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -42,6 +43,46 @@ from .models import Position, Ticker
 from .strategies.base import ENTER_LONG, ENTER_SHORT, EXIT_LONG, EXIT_SHORT, Signal
 
 log = logging.getLogger(__name__)
+
+
+def _as_finite_float(value: Any, default: float = 0.0) -> float:
+    """Best-effort numeric coercion that never raises and never returns NaN/inf.
+
+    Used on every field read back from a state file. A wrong type in one field of
+    ``positions.json`` or ``engine_state.json`` must not be able to stop the bot
+    from starting at all.
+    """
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        log.error("ignoring non-numeric state value %r; using %r", value, default)
+        return default
+    if not math.isfinite(result):
+        log.error("ignoring non-finite state value %r; using %r", value, default)
+        return default
+    return result
+
+
+def _as_optional_finite(value: Any) -> Optional[float]:
+    """Like :func:`_as_finite_float`, but unset/blank stays ``None``.
+
+    A stop price is a level or nothing. A string or a NaN here used to be stored
+    verbatim and then compared against a float on every loop, which raised out of
+    ``protective_exits`` -- ten cycles of that and the runner aborts the process.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        log.error("ignoring non-numeric price level %r", value)
+        return None
+    if not math.isfinite(result):
+        log.error("ignoring non-finite price level %r", value)
+        return None
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +170,19 @@ class PositionBook:
     losing the entry price would silently disable every stop and cooldown.
     """
 
-    def __init__(self, path: Optional[str | Path] = None) -> None:
+    def __init__(self, path: Optional[str | Path] = None, cfg: Optional[Config] = None) -> None:
+        self.cfg = cfg
         self.positions: dict[str, Position] = {}
         self.path = Path(path) if path else None
         #: Set only by a *successful* ``load()``. See ``save()`` for why the
         #: difference between "loaded and empty" and "never loaded" matters.
         self._load_attempted = False
+
+    def lot_for(self, pair: str) -> float:
+        """Smallest tradable increment, when a config with venue info is available."""
+        if self.cfg is None:
+            return 1e-9
+        return self.cfg.lot_for(pair)
 
     # -- mutation --------------------------------------------------------
     def mark(self, tickers: dict[str, Ticker]) -> None:
@@ -255,7 +303,7 @@ class PositionBook:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(self.to_dict(), indent=2, allow_nan=False), encoding="utf-8")
             tmp.replace(self.path)  # atomic: never leave a half-written state file
         except Exception as exc:
             log.error("could not persist position book: %s", exc)
@@ -270,18 +318,37 @@ class PositionBook:
             return False
         self.positions = {}
         for pair, row in (payload.get("positions") or {}).items():
-            self.positions[pair] = Position(
-                pair=pair,
-                quantity=float(row.get("quantity", 0.0)),
-                avg_price=float(row.get("avg_price", 0.0)),
-                mark_price=float(row.get("mark_price", 0.0)),
-                is_short=bool(row.get("is_short", False)),
-                collateral=float(row.get("collateral", 0.0)),
-                stop_price=row.get("stop_price"),
-                take_profit_price=row.get("take_profit_price"),
-                peak_price=float(row.get("peak_price", 0.0)),
-                opened_ts_ms=int(row.get("opened_ts_ms", 0)),
-            )
+            if not isinstance(row, dict):
+                log.error("ignoring malformed position row for %s (%r)", pair, row)
+                continue
+            try:
+                quantity = _as_finite_float(row.get("quantity"), 0.0)
+                collateral = _as_finite_float(row.get("collateral"), 0.0)
+                # A row holding no quantity and no collateral is a leftover, not a
+                # position: `{"quantity": null}` used to become a zero-quantity
+                # entry that reads as an open slot. Half a lot is the same dust
+                # threshold the balance reconciliation uses.
+                lot = self.lot_for(pair)
+                if quantity <= 0.5 * lot and collateral <= 0.0:
+                    log.error("dropping dust/empty position row for %s (quantity=%r)", pair, row.get("quantity"))
+                    continue
+                self.positions[pair] = Position(
+                    pair=pair,
+                    quantity=quantity,
+                    avg_price=_as_finite_float(row.get("avg_price"), 0.0),
+                    mark_price=_as_finite_float(row.get("mark_price"), 0.0),
+                    is_short=bool(row.get("is_short", False)),
+                    collateral=collateral,
+                    stop_price=_as_optional_finite(row.get("stop_price")),
+                    take_profit_price=_as_optional_finite(row.get("take_profit_price")),
+                    peak_price=_as_finite_float(row.get("peak_price"), 0.0),
+                    opened_ts_ms=int(_as_finite_float(row.get("opened_ts_ms"), 0.0)),
+                )
+            except Exception as exc:
+                # One unreadable row must not cost us the whole book -- the other
+                # rows hold stops and cost bases the API cannot report back.
+                log.error("could not restore position %s (%s); skipping that row", pair, exc)
+                continue
         log.info("restored %d position(s) from %s", len(self.positions), self.path)
         self._load_attempted = True
         return True
@@ -317,9 +384,20 @@ class PositionSizer:
         self.cfg = cfg
 
     def stop_distance(self, price: float, atr: Optional[float]) -> Optional[float]:
-        """Absolute stop distance, ATR-based when available (Rule 5)."""
-        if self.cfg.stop_atr_mult and atr and atr > 0:
-            return float(self.cfg.stop_atr_mult) * float(atr)
+        """Absolute stop distance, ATR-based when available (Rule 5).
+
+        A non-finite ATR counts as *unavailable*. ``atr > 0`` is False for NaN, so
+        the old test fell through to the no-stop branch and the caller then had no
+        way to tell "the stop is off by configuration" from "the ATR was junk" --
+        it approved a full-size entry with no stop at all.
+        """
+        if self.cfg.stop_atr_mult and atr is not None:
+            try:
+                atr_value = float(atr)
+            except (TypeError, ValueError):
+                atr_value = 0.0
+            if math.isfinite(atr_value) and atr_value > 0:
+                return float(self.cfg.stop_atr_mult) * atr_value
         if self.cfg.stop_loss_pct:
             return price * float(self.cfg.stop_loss_pct)
         return None
@@ -339,7 +417,7 @@ class PositionSizer:
         gross_budget_left: Optional[float] = None,
         is_short: bool = False,
     ) -> SizingResult:
-        if price <= 0 or nav <= 0:
+        if not (math.isfinite(price) and math.isfinite(nav)) or price <= 0 or nav <= 0:
             return SizingResult(0.0, 0.0, None, 0.0, "invalid_input")
 
         slot = self.slot_notional(nav)
@@ -354,16 +432,30 @@ class PositionSizer:
                 cap = risk_notional
                 binding = "risk_budget"
         else:
-            # No stop available: the risk budget cannot be expressed, so fall back
-            # to the caps and report it honestly.
+            # No stop distance, so Rule 7 cannot be expressed and the position
+            # would be sized on the caps alone -- strictly *larger* than the risk
+            # budget allows. That is the opposite of what "risk-first" means, so
+            # a stop that was *wanted* but could not be computed (a non-finite or
+            # missing ATR) refuses the entry. An operator who deliberately turned
+            # every stop off with STOP_ATR_MULT=none still gets the old
+            # caps-only fallback, reported honestly as "+no_stop".
+            stop_was_requested = bool(self.cfg.stop_atr_mult) or bool(self.cfg.stop_loss_pct)
+            if stop_was_requested and self.cfg.refuse_entry_without_stop:
+                return SizingResult(0.0, 0.0, None, 0.0, "no_stop_available")
             risk_amount = 0.0
             binding += "+no_stop"
 
+        if distance is not None and distance > 0:
+            stop_price: Optional[float] = price + distance if is_short else price - distance
+        else:
+            stop_price = None
+        if stop_price is not None and not math.isfinite(stop_price):
+            return SizingResult(0.0, 0.0, None, 0.0, "invalid_stop")
+
         cap = max(cap, 0.0)
         quantity = cap / price
-        stop_price: Optional[float] = None
-        if distance and distance > 0:
-            stop_price = price + distance if is_short else price - distance
+        if not (math.isfinite(quantity) and quantity > 0):
+            return SizingResult(0.0, 0.0, None, 0.0, "invalid_quantity")
 
         return SizingResult(
             notional=cap,
@@ -475,8 +567,33 @@ class RiskManager:
 
     # -- observation -----------------------------------------------------
     def observe(self, nav: float, now_ms: int) -> None:
-        """Update the day boundary and high-water mark; trip halts if breached."""
+        """Update the day boundary and high-water mark; trip halts if breached.
+
+        A non-finite NAV is *ignored* rather than folded into the reference
+        values. ``nan`` compares False against everything, so the old code turned
+        ``peak_nav`` into NaN on the first bad cycle and every later
+        ``if self.peak_nav > 0`` guard stayed False for the rest of the run --
+        silently disabling the permanent kill switch. A NaN also survived into
+        the persisted state, where ``json.dumps`` emits a bare ``NaN`` token that
+        strict JSON parsers reject.
+
+        A NAV at or below zero is treated as a halt, not as a drawdown to be
+        measured: the account is gone, and the guards below would otherwise
+        suppress both halts because the reference is no longer positive.
+        """
         from .candles import trading_day_id
+
+        if not math.isfinite(nav):
+            log.error("non-finite NAV (%r); ignoring it for the risk reference values", nav)
+            return
+
+        if nav <= 0:
+            if not self.halted:
+                self.halted = True
+                self.halt_reason = f"NAV {nav!r} is non-positive"
+                log.error("KILL SWITCH: %s", self.halt_reason)
+            self.last_nav = nav
+            return
 
         if self.peak_nav <= 0:
             self.peak_nav = nav
@@ -523,13 +640,19 @@ class RiskManager:
         return max(0.0, 1.0 - self.last_nav / self.peak_nav)
 
     def cooldown_blocked(self, bar_idx: int) -> set[str]:
-        """Rule 12: pairs closed within the last ``cooldown_bars`` bars."""
+        """Rule 12: pairs closed within the last ``cooldown_bars`` bars.
+
+        The comparison is inclusive of the bar that is ``cooldown_bars`` old. With
+        ``<`` an exit recorded on bar *b* stopped blocking at *b + N*, so only
+        ``N - 1`` bars were actually skipped and the documented "no re-entry for 2
+        bars" was a 1-bar wait in practice.
+        """
         if self.cfg.cooldown_bars <= 0:
             return set()
         return {
             pair
             for pair, exit_bar in self.last_exit_bar.items()
-            if bar_idx - exit_bar < self.cfg.cooldown_bars
+            if bar_idx - exit_bar <= self.cfg.cooldown_bars
         }
 
     def record_exit(self, pair: str, bar_idx: int) -> None:
@@ -558,7 +681,35 @@ class RiskManager:
                 continue
             ticker = tickers.get(pair)
             mark = ticker.mid if ticker and ticker.mid > 0 else position.mark_price
-            if mark <= 0:
+
+            # Rule 6 is checked BEFORE the mark is validated. It is the only exit
+            # that does not need a price, so it must not be gated behind one: a
+            # position whose mark went to zero (an adopted holding, a phantom
+            # fill, a venue that stopped quoting the pair) used to skip every
+            # exit here *and* every exit in the execution layer, which refused to
+            # sell without a usable price. The position became permanently stuck,
+            # including for the kill switch.
+            if self.cfg.max_hold_bars and position.opened_ts_ms:
+                held = now_bar - bar_index(position.opened_ts_ms, self.cfg.bar_seconds)
+                if held >= int(self.cfg.max_hold_bars):
+                    out.append(
+                        Signal(
+                            pair,
+                            EXIT_SHORT if position.is_short else EXIT_LONG,
+                            reason=f"time stop: held {held} bars >= {self.cfg.max_hold_bars}",
+                            meta={"trigger": "time_stop", "bars_held": held},
+                        )
+                    )
+                    continue
+
+            if not (mark > 0) or not math.isfinite(mark):
+                # No usable mark and the time stop has not fired yet. Nothing can
+                # be evaluated from here, but say so rather than silence.
+                log.warning(
+                    "%s: no usable mark (mark_price=%r); cannot evaluate the stop this loop",
+                    pair,
+                    position.mark_price,
+                )
                 continue
 
             # Rule 5: ATR stop.
@@ -607,18 +758,6 @@ class RiskManager:
                     )
                     continue
 
-            # Rule 6: time stop.
-            if self.cfg.max_hold_bars and position.opened_ts_ms:
-                held = now_bar - bar_index(position.opened_ts_ms, self.cfg.bar_seconds)
-                if held >= int(self.cfg.max_hold_bars):
-                    out.append(
-                        Signal(
-                            pair,
-                            EXIT_SHORT if position.is_short else EXIT_LONG,
-                            reason=f"time stop: held {held} bars >= {self.cfg.max_hold_bars}",
-                            meta={"trigger": "time_stop", "bars_held": held},
-                        )
-                    )
         return out
 
     # -- approval --------------------------------------------------------
@@ -781,14 +920,38 @@ class RiskManager:
         }
 
     def restore(self, data: dict[str, Any]) -> None:
-        self.peak_nav = float(data.get("peak_nav", 0.0) or 0.0)
-        self.day_id = data.get("day_id")
-        self.day_start_nav = float(data.get("day_start_nav", 0.0) or 0.0)
+        """Restore risk state, tolerating a malformed field.
+
+        Each field is coerced independently so one wrong type -- a string where a
+        number belongs, a null quantity -- degrades that single value instead of
+        aborting the whole start-up. An exception here used to escape
+        ``TradingEngine._load_risk_state`` and stop ``bootstrap()`` before
+        ``_ready`` was set, which under ``Restart=always`` is a restart loop that
+        never trades.
+        """
+        peak = _as_finite_float(data.get("peak_nav"), 0.0)
+        day_start = _as_finite_float(data.get("day_start_nav"), 0.0)
+        self.peak_nav = peak
+        self.day_start_nav = day_start
+        day_id = data.get("day_id")
+        try:
+            self.day_id = int(day_id) if day_id is not None else None
+        except (TypeError, ValueError):
+            log.error("ignoring malformed day_id %r in the restored risk state", day_id)
+            self.day_id = None
         self.daily_halt = bool(data.get("daily_halt", False))
-        self.daily_halt_reason = str(data.get("daily_halt_reason", ""))
+        self.daily_halt_reason = str(data.get("daily_halt_reason", "") or "")
         self.halted = bool(data.get("halted", False))
-        self.halt_reason = str(data.get("halt_reason", ""))
-        self.last_exit_bar = {k: int(v) for k, v in (data.get("last_exit_bar") or {}).items()}
+        self.halt_reason = str(data.get("halt_reason", "") or "")
+        last_exit: dict[str, int] = {}
+        raw_exits = data.get("last_exit_bar")
+        if isinstance(raw_exits, dict):
+            for pair, bar in raw_exits.items():
+                try:
+                    last_exit[str(pair)] = int(bar)
+                except (TypeError, ValueError):
+                    log.error("ignoring malformed cooldown entry %s=%r", pair, bar)
+        self.last_exit_bar = last_exit
 
     def attach_tracker(self, tracker: MetricTracker) -> None:
         """Keep the high-water mark consistent with the equity tracker."""

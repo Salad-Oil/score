@@ -93,6 +93,12 @@ class PerformanceMetrics:
     periods_per_year: int = 365
     composite: Optional[float] = None
     composite_components: dict[str, float] = field(default_factory=dict)
+    #: True when at least one ratio was missing, so the weights in
+    #: ``composite_components`` were renormalised over the survivors. Such a score
+    #: is comparable across early partial reports but is NOT the leaderboard's
+    #: fixed-weight 0.4/0.3/0.3 formula, and a caller that quotes it as though it
+    #: were should say so.
+    composite_is_partial: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -144,7 +150,7 @@ def compute_metrics(
     cap: float = DEFAULT_RATIO_CAP,
 ) -> PerformanceMetrics:
     """Compute the full metric set from an equity curve sampled at a fixed rate."""
-    curve = [float(v) for v in equity if v is not None]
+    curve = [float(v) for v in equity if v is not None and math.isfinite(float(v))]
     metrics = PerformanceMetrics(periods_per_year=periods_per_year)
     if len(curve) < 2:
         if curve:
@@ -190,6 +196,31 @@ def compute_metrics(
         metrics.calmar = _clamp(metrics.annualized_return / metrics.max_drawdown, cap)
 
     metrics.composite, metrics.composite_components = composite_score(metrics)
+    metrics.composite_is_partial = len(metrics.composite_components) != len(COMPOSITE_WEIGHTS)
+    return metrics
+
+
+def _as_intraday_report(metrics: PerformanceMetrics) -> PerformanceMetrics:
+    """Strip annualised figures from a report that spans less than one day.
+
+    Ratios and returns are annualised from an assumed sampling rate, and with
+    fewer than two daily marks there is no daily rate to annualise from. The
+    level figures (equity, total return, drawdown, win rate) are still meaningful
+    and stay; the per-year extrapolations become ``None`` and the composite is
+    left unset rather than quoting a score built on a made-up factor.
+    """
+    for name in (
+        "annualized_return",
+        "annualized_volatility",
+        "sharpe",
+        "sortino",
+        "calmar",
+        "composite",
+    ):
+        setattr(metrics, name, None)
+    metrics.periods_per_year = 0
+    metrics.composite_components = {}
+    metrics.composite_is_partial = True
     return metrics
 
 
@@ -238,8 +269,18 @@ class MetricTracker:
         self.peak_equity = float(initial_equity)
 
     def record(self, ts_ms: int, equity: float) -> None:
-        self.snapshots.append((int(ts_ms), float(equity)))
-        self.peak_equity = max(self.peak_equity, float(equity))
+        """Append one equity mark, ignoring a non-finite one.
+
+        A NaN mark would poison ``peak_equity`` (``max(nan, x)`` is NaN for every
+        x), the daily resampling, every ratio and the persisted state -- and it
+        compares False against every bound, so it would silently disable the
+        drawdown guard rather than trip it.
+        """
+        value = float(equity)
+        if not math.isfinite(value):
+            return
+        self.snapshots.append((int(ts_ms), value))
+        self.peak_equity = max(self.peak_equity, value)
 
     @property
     def latest_equity(self) -> float:
@@ -259,11 +300,34 @@ class MetricTracker:
         return self.latest_equity / self.initial_equity - 1.0
 
     def metrics(self, daily: bool = True) -> PerformanceMetrics:
+        """Metrics for the live tracker.
+
+        Reported ratios use the daily-resampled curve, because a 60-second
+        sampling rate annualised with a *daily* factor would inflate every ratio
+        by roughly 24x (a 5-second loop far more).
+
+        The first UTC day is the case that used to slip through: with a single
+        daily mark there is nothing to resample, the raw per-loop marks are used
+        instead, and they were still annualised with ``periods_per_year``. So for
+        the first hours of the competition the report showed ratios built from a
+        grid the factor did not describe. Here the factor is derived from the
+        marks themselves whenever they are not daily.
+        """
         if daily:
             curve = daily_equity_marks(self.snapshots)
             if len(curve) < 2:
-                # Same-day only: fall back to the raw marks so the report is not empty.
+                # Same-day only: fall back to the raw marks so the report is not
+                # empty, but report them as *not annualised* rather than pretending
+                # a per-loop grid is a daily one. Annualising 60-second marks with
+                # a daily factor inflated every ratio by ~24x (a 5-second loop far
+                # more) for the first hours of the run.
                 curve = [self.initial_equity] + [v for _, v in self.snapshots]
+                intraday = compute_metrics(
+                    curve,
+                    periods_per_year=self.periods_per_year,
+                    risk_free_rate=self.risk_free_rate,
+                )
+                return _as_intraday_report(intraday)
         else:
             curve = [self.initial_equity] + [v for _, v in self.snapshots]
         return compute_metrics(
@@ -271,6 +335,15 @@ class MetricTracker:
             periods_per_year=self.periods_per_year,
             risk_free_rate=self.risk_free_rate,
         )
+
+    def implied_seconds_per_period(self) -> Optional[float]:
+        """Median gap between marks, in seconds (``None`` before there are two)."""
+        if len(self.snapshots) < 2:
+            return None
+        gaps = sorted(b[0] - a[0] for a, b in zip(self.snapshots, self.snapshots[1:]) if b[0] > a[0])
+        if not gaps:
+            return None
+        return gaps[len(gaps) // 2] / 1000.0
 
     def day_start_equity(self, ts_ms: int) -> float:
         """Equity at the start of the UTC day containing ``ts_ms`` (for the daily loss cap)."""

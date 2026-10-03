@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -48,8 +49,14 @@ TRADE_CSV_COLUMNS = [
 
 def _jsonable(value: Any) -> Any:
     """Best-effort conversion so one odd object cannot break a journal write."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        # A bare NaN/Infinity token is not valid JSON, and every downstream
+        # reader (judges' tooling included) is entitled to assume the audit trail
+        # parses. Record it as a string instead -- the event still shows what
+        # happened, and the file stays machine-readable.
+        return value if math.isfinite(value) else repr(value)
     if is_dataclass(value) and not isinstance(value, type):
         return {k: _jsonable(v) for k, v in asdict(value).items()}
     if isinstance(value, dict):

@@ -49,9 +49,29 @@ run that added this job reported **success** for exactly that reason. The
 full-history scan is what makes this job meaningful; it walks
 `git log --all` rather than a commit range.
 
-`secret-scan` is currently **not** part of the required `ci` check, because it
-scans history and history still contains a leaked key (see below), so it is red
-until the purge is done. Add it to the required checks afterwards.
+### Status: the history has been purged, and the job is green again
+
+The purge described below (`git filter-repo`, then a force-push) **has been
+done**. A fresh clone of `main` contains 26 commits, none of them the offending
+file, and `python scripts/scan_secrets.py --history` reports
+`no credentials found (history)`. The `secret-scan` job passes.
+
+Two consequences, and both need an owner:
+
+* **`secret-scan` is still not part of the required `ci` check.** The `ci` gate
+  job only asserts the test matrix (`needs: test`), so a pull request that
+  introduces a credential can still be merged. Now that the job is green, add it
+  to the ruleset's required checks -- that was the stated reason for leaving it
+  out, and the reason no longer holds.
+* **Confirm the key was rotated.** Rewriting history does not invalidate a
+  credential. If the rotation in step 1 below was never performed, the key is
+  still live no matter how clean the history looks.
+
+> Note: GitHub may keep serving *unreachable* objects from before a force-push
+> for a while, so the REST API can still list pre-purge commit metadata even
+> though `raw.githubusercontent.com` returns 404 for the file and no ref
+> contains it. Judge cleanliness by `git log --all` on a fresh clone, not by the
+> API's commit list.
 
 If a string is a *published example* rather than a credential, add the exact
 value to `ALLOWED_VALUES` in `scripts/scan_secrets.py` and the `[allowlist]`
