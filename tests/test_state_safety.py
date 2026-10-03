@@ -633,6 +633,69 @@ class TestEdgeAnalysisTool(unittest.TestCase):
         self.assertAlmostEqual(self.tool.TAKER, 0.001)
         self.assertAlmostEqual(self.tool.MAKER, 0.0005)
 
+    # -- the passive-fill model ------------------------------------------
+    def _series(self, highs, lows, closes, name: str = "BTC-USD_30m.csv") -> None:
+        self.tool._SERIES[name] = (highs, lows, closes)
+
+    def test_a_touch_fills_and_a_miss_does_not(self) -> None:
+        """The limit is the signal bar's close; bar i+1 decides whether it fills."""
+        n = self.tool.HORIZON_BARS + 4
+        closes = [100.0] * n
+        z = [-2.0] + [-1.0] * (n - 1)
+
+        # The fill bar dips to exactly the limit -> a 'touch' fill, no 'through' fill.
+        lows = [100.0] * n
+        lows[1] = 100.0
+        highs = [101.0] * n
+        self._series(highs, lows, closes)
+        _ret, touched = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 0.0, "touch")
+        _ret2, through = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 0.0, "through")
+        self.assertTrue(touched, "touching the limit should fill under the 'touch' model")
+        self.assertFalse(through, "touching but not penetrating must not fill 'through'")
+
+    def test_a_bar_that_never_reaches_the_limit_does_not_fill(self) -> None:
+        n = self.tool.HORIZON_BARS + 4
+        closes = [100.0] * n
+        z = [-2.0] + [-1.0] * (n - 1)
+        highs = [105.0] * n
+        lows = [101.0] * n  # stays above the 100 limit
+        self._series(highs, lows, closes)
+        _ret, filled = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 0.0, "touch")
+        self.assertFalse(filled)
+
+    def test_the_offset_lowers_the_resting_bid(self) -> None:
+        """A 10bp offset bids 0.1% below the signal close, so it fills less often."""
+        n = self.tool.HORIZON_BARS + 4
+        closes = [100.0] * n
+        z = [-2.0] + [-1.0] * (n - 1)
+        highs = [101.0] * n
+        lows = [100.0] * n
+        self._series(highs, lows, closes)
+        _r, at_market = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 0.0, "touch")
+        _r2, ten_bp = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 10.0, "touch")
+        self.assertTrue(at_market)
+        self.assertFalse(ten_bp, "a bid 10bp lower should not fill on a bar that only reached 100")
+
+    def test_a_passive_fill_returns_the_target_move_from_the_limit(self) -> None:
+        """Entry is the limit (passive), exit is the same target as the market case."""
+        n = self.tool.HORIZON_BARS + 4
+        closes = [100.0] * n
+        z = [-2.0] + [-1.0] * (n - 1)
+        closes[3] = 110.0        # reaches the target on the exit search
+        z[3] = -0.1
+        highs = [101.0] * n
+        lows = [100.0] * n
+        self._series(highs, lows, closes)
+        ret, filled = self.tool.maker_entry("BTC-USD_30m.csv", 0, closes, z, 0.0, "touch")
+        self.assertTrue(filled)
+        self.assertAlmostEqual(ret, 0.10, places=9)
+
+    def test_an_unknown_fill_model_is_rejected(self) -> None:
+        n = self.tool.HORIZON_BARS + 4
+        self._series([1.0] * n, [1.0] * n, [1.0] * n)
+        with self.assertRaises(ValueError):
+            self.tool.maker_entry("BTC-USD_30m.csv", 0, [1.0] * n, [-2.0] * n, 0.0, "guess")
+
 
 # ---------------------------------------------------------------------------
 class TestSecretScanner(unittest.TestCase):

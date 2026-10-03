@@ -199,74 +199,6 @@ policy and a cost model. `scripts/edge_analysis.py` separates them, and the
 separation is the important result:
 
 ```bash
-python scripts/edge_analysis.py      # needs data/ from scripts/fetch_history.py
-```
-
-**The mean does revert.** Of 570 Rule 2 long entries (ADX < 25), Z reached the
-−0.25 exit target within 24 bars **63.2%** of the time, median 10 bars. So the
-signal is not noise, and the 100% win rate on z-exits is not an artefact.
-
-**The edge is smaller than the fee.** Measured with no stop at all, so the exit
-policy cannot be blamed:
-
-| exit policy | n | mean gross | median gross | mean **net** of 0.30% |
-|---|---|---|---|---|
-| hold to the −0.25 target | 570 | **+0.095%** | +0.340% | **−0.205%** |
-| Rule 6 only (12-bar time stop) | 570 | +0.113% | +0.181% | −0.187% |
-| the shipped Rule 5 + Rule 6 | — | +0.113% | +0.181% | −0.187% |
-
-A 2σ deviation reverting to −0.25σ is a move of roughly **0.1–0.35%**, and a round
-trip costs **0.30%**. The target distance and the cost are the same order of
-magnitude, so the strategy is a coin-flip on a 0.3% fee. **No stop parameter, no
-sizing rule and no filter can rescue that**, because none of them change what a
-completed round trip is worth.
-
-**Raising the threshold is the one lever, and it is not reliable.** Since the edge
-is proportional to the size of the deviation, demanding a bigger deviation is the
-only thing that can clear the cost. Chronological 60/40 split, net of cost, with a
-t-statistic for each half:
-
-| z_entry | ADX | n (early) | net (early) | t | n (late) | net (late) | t |
-|---|---|---|---|---|---|---|---|
-| 2.0 | on | 384 | −0.177% | −2.44 | 186 | −0.262% | −2.67 |
-| 3.0 | on | 84 | −0.117% | −0.70 | 30 | −0.089% | −0.29 |
-| 3.5 | **off** | 105 | +0.076% | +0.35 | 49 | +0.055% | +0.29 |
-| 4.0 | **off** | 39 | +0.425% | +1.20 | 19 | **−0.133%** | −0.50 |
-
-Only one cell keeps its sign in both halves (z ≥ 3.5, ADX off) — at **+0.06% net
-with t ≈ 0.3**, which is indistinguishable from zero on 49 out-of-sample trades.
-The one cell that looks attractive in the early window (z ≥ 4.0) flips negative
-late. That is the overfitting trap, visible in one table.
-
-**And the frequency is unusable.** Rule compliance wants at least 8 active trading
-days with trades each day:
-
-| z_entry | ADX | entries/day | over a 14-day window |
-|---|---|---|---|
-| 2.0 | on | 4.75 | 67 |
-| 3.0 | on | 0.95 | 13 |
-| 3.5 | on | 0.47 | **6.6** |
-| 4.0 | on | 0.18 | **2.6** |
-
-The thresholds that might clear the cost are the ones that barely trade. The
-competition's activity requirement and the strategy's economics pull in opposite
-directions at every parameter setting.
-
-**Conclusion.** The strategy is not `stop_atr_mult` away from working. It is
-structurally unprofitable at this horizon and this cost, which is why section 5's
-grid loses in all 12 cells and why every in-sample improvement died out of sample.
-What would change the answer is a signal whose *typical completed move* is several
-times the 0.30% round trip (a longer holding horizon, a larger deviation with the
-frequency accepted as a cost, or maker-side execution to cut the fee to 0.20%) —
-not another pass over these parameters.
-
-## 6b. The edge itself, measured — and why tuning cannot fix it
-
-Everything above reports what the *strategy* did, which mixes an edge, an exit
-policy and a cost model. `scripts/edge_analysis.py` separates them, and the
-separation is the important result:
-
-```bash
 python scripts/edge_analysis.py                       # the shipped setup
 python scripts/edge_analysis.py --folds 5             # the decisive stability test
 python scripts/edge_analysis.py --z-entry 3.0 --gate 0.006
@@ -343,10 +275,48 @@ it is worth keeping; it is not the lever.
 structurally unprofitable at this horizon and this cost, which is why section 5's
 grid loses in all 12 cells and why every in-sample improvement died out of sample.
 What would change the answer is a signal whose *typical completed move* is several
-times the 0.30% round trip — maker-side execution to cut the fee toward 0.20%, a
-materially longer holding period, or a genuine regime filter that refuses to trade
-when the reversion does not show up (see the fold table: folds 1, 3 and 4 are
-where the money goes). Not another pass over these parameters.
+times the 0.30% round trip — a materially longer holding period, or a genuine
+regime filter that refuses to trade when the reversion does not show up (see the
+fold table: folds 1, 3 and 4 are where the money goes). Not another pass over
+these parameters.
+
+### 6b.1 Maker execution, measured
+
+The bot sends market orders only (`engine.py` uses `place_order(..., "MARKET")`),
+so it pays the taker fee *and* crosses the spread on every entry. A resting bid at
+the signal bar's close pays the maker fee and crosses nothing. The tool models it:
+
+```bash
+python scripts/edge_analysis.py --maker
+```
+
+The fill assumption is the whole argument, so both readings are reported.
+`touch` fills when the fill bar's low reaches the limit (first in the queue);
+`through` demands the bar trade strictly *below* it (pessimistic). An unfilled
+order means the trade does not happen at all — fewer trades, not the same trades
+cheaper.
+
+| entry | n | filled | mean net | win |
+|---|---|---|---|---|
+| market order (what ships today) | 570 | 100% | −0.336% | 28.8% |
+| limit, `touch` | 563 | **98.8%** | −0.285% | 32.5% |
+| limit, `through` | 543 | **95.3%** | **−0.289%** | 32.4% |
+
+Two things worth stating plainly:
+
+* **It helps, by about a seventh of the loss.** −0.336% → −0.289% is **+0.047 per
+  trade**. The saving is smaller than it first looks because only the *entry* is
+  passive — the exit still crosses the spread, so the round trip goes 0.30% →
+  0.25% (0.1% taker + 0.05% maker + slippage on both sides), not down to 0.15%.
+* **It does not fix anything.** All five folds stay negative, including the most
+  recent (−0.196%), so it fails the same test the parameters fail.
+
+The **95–99% fill rate is the softest number in this document** and should not be
+trusted as much as the rest of it. It comes from OHLC bars, and "the low reached my
+limit" is not the same as "my order was at the front of the queue at that price".
+In a real book a resting bid fills only when someone sells into it, and queue
+position delays or loses the fill. Treat `through` as the number to plan on, and
+confirm the real rate in the live journal before relying on it.
 
 > **How to check any future change with this.** Run `edge_analysis.py`, read the
 > `net @ 0.30%` line in part 2, and require part 4 to be positive in most folds
