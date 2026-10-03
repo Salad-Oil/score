@@ -216,9 +216,6 @@ class Backtester:
         configure = getattr(self.strategy, "configure_execution", None)
         if configure is not None:
            configure(cfg)
-        configure = getattr(self.strategy, "configure_execution", None)
-        if configure is not None:
-            configure(cfg)
         self.label = label
         self.execution_delay_bars = max(0, int(execution_delay_bars))
         self.assumed_spread_bps = float(assumed_spread_bps)
