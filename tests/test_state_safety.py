@@ -589,6 +589,52 @@ class TestTextEncodingGuard(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+class TestEdgeAnalysisTool(unittest.TestCase):
+    """The analysis tool decides whether a change is worth making, so it is tested.
+
+    Its most dangerous property is the fill assumption: measuring from the signal
+    bar's own close instead of the next bar's was worth 0.13 percentage points per
+    trade -- four times the edge being measured -- and it flipped the conclusion.
+    """
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        import edge_analysis
+
+        self.tool = edge_analysis
+
+    def test_the_fill_happens_one_bar_after_the_signal(self) -> None:
+        """The measured return must start at the FILL bar, not the signal bar."""
+        n = self.tool.HORIZON_BARS + 4
+        # Signal on bar 1 (close 100). The next bar closes at 200 and nothing moves
+        # after that, so a correctly-filled trade returns exactly 0 while a trade
+        # filled at the signal bar's own close would report +100%.
+        closes = [10.0, 100.0] + [200.0] * (n - 2)
+        z = [0.0, -2.0] + [-1.5] * (n - 2)
+        self.assertAlmostEqual(self.tool.forward_return(1, closes, z), 0.0, places=12)
+
+    def test_the_target_exit_is_used_when_it_comes_first(self) -> None:
+        n = self.tool.HORIZON_BARS + 4
+        closes = [10.0, 100.0, 100.0, 150.0] + [120.0] * (n - 4)
+        z = [0.0, -2.0, -2.0, -0.1] + [0.0] * (n - 4)
+        # Filled at 100 on bar 2, exits at the -0.25 target on bar 3 at 150.
+        self.assertAlmostEqual(self.tool.forward_return(1, closes, z), 0.5, places=12)
+
+    def test_match_span_keeps_the_wall_clock_window(self) -> None:
+        """48 bars of 30m is 24h, so 4h bars need a 6-bar window, not 48."""
+        self.assertEqual(self.tool.span_window("30m"), 48)
+        self.assertEqual(self.tool.span_window("4h"), 6)
+
+    def test_an_unknown_interval_is_rejected_loudly(self) -> None:
+        with self.assertRaises(SystemExit):
+            self.tool.span_window("7m")
+
+    def test_the_cost_model_matches_the_rulebook(self) -> None:
+        self.assertAlmostEqual(self.tool.TAKER, 0.001)
+        self.assertAlmostEqual(self.tool.MAKER, 0.0005)
+
+
+# ---------------------------------------------------------------------------
 class TestSecretScanner(unittest.TestCase):
     """The old guard read filenames; this one reads bytes."""
 

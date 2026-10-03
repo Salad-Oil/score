@@ -192,6 +192,167 @@ one encouraging number is that the reversion target itself is reached reliably:
 when a trade is allowed to reach the mean, it wins 100% of the time. The problem
 is how many trades get killed before they get there.
 
+## 6b. The edge itself, measured — and why tuning cannot fix it
+
+Everything above reports what the *strategy* did, which mixes an edge, an exit
+policy and a cost model. `scripts/edge_analysis.py` separates them, and the
+separation is the important result:
+
+```bash
+python scripts/edge_analysis.py      # needs data/ from scripts/fetch_history.py
+```
+
+**The mean does revert.** Of 570 Rule 2 long entries (ADX < 25), Z reached the
+−0.25 exit target within 24 bars **63.2%** of the time, median 10 bars. So the
+signal is not noise, and the 100% win rate on z-exits is not an artefact.
+
+**The edge is smaller than the fee.** Measured with no stop at all, so the exit
+policy cannot be blamed:
+
+| exit policy | n | mean gross | median gross | mean **net** of 0.30% |
+|---|---|---|---|---|
+| hold to the −0.25 target | 570 | **+0.095%** | +0.340% | **−0.205%** |
+| Rule 6 only (12-bar time stop) | 570 | +0.113% | +0.181% | −0.187% |
+| the shipped Rule 5 + Rule 6 | — | +0.113% | +0.181% | −0.187% |
+
+A 2σ deviation reverting to −0.25σ is a move of roughly **0.1–0.35%**, and a round
+trip costs **0.30%**. The target distance and the cost are the same order of
+magnitude, so the strategy is a coin-flip on a 0.3% fee. **No stop parameter, no
+sizing rule and no filter can rescue that**, because none of them change what a
+completed round trip is worth.
+
+**Raising the threshold is the one lever, and it is not reliable.** Since the edge
+is proportional to the size of the deviation, demanding a bigger deviation is the
+only thing that can clear the cost. Chronological 60/40 split, net of cost, with a
+t-statistic for each half:
+
+| z_entry | ADX | n (early) | net (early) | t | n (late) | net (late) | t |
+|---|---|---|---|---|---|---|---|
+| 2.0 | on | 384 | −0.177% | −2.44 | 186 | −0.262% | −2.67 |
+| 3.0 | on | 84 | −0.117% | −0.70 | 30 | −0.089% | −0.29 |
+| 3.5 | **off** | 105 | +0.076% | +0.35 | 49 | +0.055% | +0.29 |
+| 4.0 | **off** | 39 | +0.425% | +1.20 | 19 | **−0.133%** | −0.50 |
+
+Only one cell keeps its sign in both halves (z ≥ 3.5, ADX off) — at **+0.06% net
+with t ≈ 0.3**, which is indistinguishable from zero on 49 out-of-sample trades.
+The one cell that looks attractive in the early window (z ≥ 4.0) flips negative
+late. That is the overfitting trap, visible in one table.
+
+**And the frequency is unusable.** Rule compliance wants at least 8 active trading
+days with trades each day:
+
+| z_entry | ADX | entries/day | over a 14-day window |
+|---|---|---|---|
+| 2.0 | on | 4.75 | 67 |
+| 3.0 | on | 0.95 | 13 |
+| 3.5 | on | 0.47 | **6.6** |
+| 4.0 | on | 0.18 | **2.6** |
+
+The thresholds that might clear the cost are the ones that barely trade. The
+competition's activity requirement and the strategy's economics pull in opposite
+directions at every parameter setting.
+
+**Conclusion.** The strategy is not `stop_atr_mult` away from working. It is
+structurally unprofitable at this horizon and this cost, which is why section 5's
+grid loses in all 12 cells and why every in-sample improvement died out of sample.
+What would change the answer is a signal whose *typical completed move* is several
+times the 0.30% round trip (a longer holding horizon, a larger deviation with the
+frequency accepted as a cost, or maker-side execution to cut the fee to 0.20%) —
+not another pass over these parameters.
+
+## 6b. The edge itself, measured — and why tuning cannot fix it
+
+Everything above reports what the *strategy* did, which mixes an edge, an exit
+policy and a cost model. `scripts/edge_analysis.py` separates them, and the
+separation is the important result:
+
+```bash
+python scripts/edge_analysis.py                       # the shipped setup
+python scripts/edge_analysis.py --folds 5             # the decisive stability test
+python scripts/edge_analysis.py --z-entry 3.0 --gate 0.006
+python scripts/edge_analysis.py --data-dir data_4h --interval 4h --match-span
+```
+
+**The mean does revert.** Of 570 Rule 2 long entries (ADX < 25), Z reached the
+−0.25 exit target within 24 bars **64.9%** of the time, median 9 bars (~4.5h). So
+the signal is not noise, and the 100% win rate on z-exits is not an artefact.
+
+**The edge is smaller than the fee.** Measured with no stop at all, so the exit
+policy cannot be blamed, and filling one bar after the signal — which is what
+`Backtester` actually does (`execution_delay_bars=1`):
+
+| | n | mean gross | median gross | net of 0.30% |
+|---|---|---|---|---|
+| hold to the −0.25 target | 570 | **−0.036%** | −0.010% | **−0.336%** |
+| the same at maker cost (0.25%) | 570 | −0.036% | −0.010% | −0.286% |
+
+A 2σ deviation reverting to −0.25σ is a move of about **0.1–0.3%**, and a round
+trip costs **0.30%**. The target distance and the cost are the same order of
+magnitude, so a completed trade is a coin flip on a 0.3% fee. **No stop parameter,
+no sizing rule and no filter can rescue that**, because none of them change what a
+completed round trip is worth.
+
+> **A measurement trap worth recording.** Filling at the signal bar's own close
+> instead of the next bar's gives +0.095% where the honest figure is −0.036%. That
+> one-bar difference is 0.13 percentage points — four times the entire edge being
+> measured, and enough to flip the conclusion. Any measurement of this strategy
+> must state its fill assumption.
+
+**No parameter survives the decisive test.** Split the timeline into five
+consecutive folds and require the sign to hold; a single 60/40 split can be passed
+by luck, and a grid can be mined until one cell looks good in both halves. Net of
+0.30%:
+
+| z_entry | fold 1 | fold 2 | fold 3 | fold 4 | **fold 5 (most recent)** |
+|---|---|---|---|---|---|
+| 2.0 (shipped) | −0.756% | −0.056% | −0.334% | −0.331% | **−0.240%** |
+| 2.5 | −0.548% | −0.127% | −0.378% | −0.370% | **−0.241%** |
+| 3.0 | −0.306% | −0.062% | −0.335% | −0.442% | **−0.219%** |
+| 3.5 | −0.165% | +0.221% | −0.318% | −0.791% | **−0.292%** |
+
+Every threshold loses in four of five folds and loses in the most recent one. The
+single positive cell (z ≥ 3.5, fold 2) sits between two negative folds, which is
+what noise looks like. **This is the mathematical form of "there is no parameter
+plateau"** in section 5: the folds disagree with each other, not with the
+parameter, which means the outcome is driven by which kind of market happened to
+be in the window.
+
+**Raising the threshold does not clear the cost either.** Selectivity cuts the
+*number* of trades without raising the per-trade edge above the fee, and the
+thresholds that come closest to it are the ones that barely trade:
+
+| z_entry | entries/day | over a 14-day window |
+|---|---|---|
+| 2.0 | 4.75 | 67 |
+| 3.0 | 0.95 | 13 |
+| 3.5 | 0.47 | **7** |
+| 4.0 | 0.18 | **3** |
+
+**A longer bar does not fix it either.** On 4-hour bars (2 years, 8 majors) the
+same measurement gives 0.04–0.15 trades per day — 1 to 2 trades in a 14-day
+window — so there is nothing to average, whatever the per-trade number says.
+
+**The Rule 4 deviation gate is not a fix.** The team runs with
+`enforce_min_deviation: true`. Measured with the gate off versus on, on the same
+data and the same cost model, it moves the in-sample composite from −7.93 to
+−6.81 and cuts fills by ~20%, but the loss per trade is unchanged: it removes
+trades broadly rather than removing the unprofitable ones. It is not harmful and
+it is worth keeping; it is not the lever.
+
+**Conclusion.** The strategy is not `stop_atr_mult` away from working. It is
+structurally unprofitable at this horizon and this cost, which is why section 5's
+grid loses in all 12 cells and why every in-sample improvement died out of sample.
+What would change the answer is a signal whose *typical completed move* is several
+times the 0.30% round trip — maker-side execution to cut the fee toward 0.20%, a
+materially longer holding period, or a genuine regime filter that refuses to trade
+when the reversion does not show up (see the fold table: folds 1, 3 and 4 are
+where the money goes). Not another pass over these parameters.
+
+> **How to check any future change with this.** Run `edge_analysis.py`, read the
+> `net @ 0.30%` line in part 2, and require part 4 to be positive in most folds
+> and not negative in fold 5. A change that only improves the full-sample total
+> return has not been demonstrated to work; it has been fitted.
+
 ## 7. Method caveats (read before quoting any of this)
 
 * **Removing the stop also removes risk-based sizing.** With no stop distance,
