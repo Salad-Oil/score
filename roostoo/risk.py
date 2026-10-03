@@ -28,6 +28,7 @@ current policy.
 """
 
 from __future__ import annotations
+from .strategies.scoring import execution_terms
 
 import json
 import logging
@@ -858,6 +859,34 @@ class RiskManager:
                 gross_budget_left=gross_cap - projected_gross,
                 is_short=is_short,
             )
+            
+            scored_meta = dict(signal.meta)
+            if "scoring_version" in signal.meta:
+                if is_short:
+                    decision.rejected.append((pair, "scored v1 is long-only"))
+                    continue
+                if ticker is None or not all(math.isfinite(x) and x > 0 for x in (ticker.max_bid, ticker.min_ask)) or ticker.max_bid > ticker.min_ask or ticker.spread_bps > self.cfg.max_spread_bps:
+                    decision.rejected.append((pair, "invalid or wide scored quote"))
+                    continue
+                rejection, terms = execution_terms(
+                    self.cfg, signal.meta, reference=price,
+                    spread_bps=ticker.spread_bps, stop_price=sizing.stop_price,
+                    now_ms=now_ms,
+                )
+                if rejection:
+                    decision.rejected.append((pair, rejection))
+                    continue
+                loss_fraction = (price - sizing.stop_price) / price + terms["cost_pct"]
+                score_cap = view.nav * terms["risk_per_trade_pct"] / loss_fraction
+                if score_cap < sizing.notional:
+                    sizing.notional = score_cap
+                    sizing.quantity = score_cap / price
+                    sizing.binding = "score_risk_budget"
+                sizing.risk_amount = sizing.notional * loss_fraction
+                scored_meta.update(terms)
+                scored_meta["entry_score_at_signal"] = signal.meta.get("entry_score")
+                scored_meta["factor_scores"] = {**signal.meta.get("factor_scores", {}), "cost": int(terms["cost_score"])}
+                
             if sizing.notional < self.cfg.min_order_notional:
                 decision.rejected.append(
                     (pair, f"sized {sizing.notional:,.2f} < min order {self.cfg.min_order_notional:,.2f}")
@@ -875,7 +904,7 @@ class RiskManager:
                     stop_price=sizing.stop_price,
                     risk_amount=sizing.risk_amount,
                     binding=sizing.binding,
-                    meta={**dict(signal.meta), "strength": round(signal.strength, 4)},
+                    meta={**scored_meta), "strength": round(signal.strength, 4)},
                 )
             )
             projected_pairs.add(pair)
