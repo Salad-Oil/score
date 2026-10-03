@@ -73,6 +73,10 @@ class EngineStats:
     unknown_orders: int = 0
     reconciliations: int = 0
     consecutive_failures: int = 0
+    #: Maker entries posted and cancelled. The ratio is the live fill rate, which
+    #: is the number the backtest's 95-99% assumption most needs checking against.
+    orders_posted: int = 0
+    orders_cancelled: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -84,6 +88,8 @@ class EngineStats:
             "order_errors": self.order_errors,
             "unknown_orders": self.unknown_orders,
             "reconciliations": self.reconciliations,
+            "orders_posted": self.orders_posted,
+            "orders_cancelled": self.orders_cancelled,
         }
 
 
@@ -121,6 +127,9 @@ class TradingEngine:
         #: Best-known notional per pair with a resting order, so the risk layer
         #: reserves what is actually committed rather than a flat full slot.
         self._pending_notional_by_pair: dict[str, float] = {}
+        #: Maker entries we posted that have not filled yet, as
+        #: ``pair -> (bar placed, limit price)``. Only used to cancel stale ones.
+        self._resting: dict[str, tuple[int, float]] = {}
         self._shutting_down = False
         #: Gate for ``_persist()``. Stays False until ``bootstrap()`` has
         #: completed, so a startup failure can never overwrite stored state.
@@ -288,6 +297,11 @@ class TradingEngine:
             self._persist()
             self._shutting_down = True
             return
+
+        # --- stale maker entries are released before new ones are posted -----
+        # Cancelling first means a bid that has gone stale frees its capital and
+        # its slot in the same cycle that would re-post it, instead of one bar later.
+        self._expire_resting_orders(now_ms, current_bar)
 
         # --- protective exits run every loop (Rule 5) ---------------------
         protective = self.risk.protective_exits(self.book.held(), tickers, now_ms)
@@ -743,6 +757,11 @@ class TradingEngine:
         ticker = self.tickers.get(action.pair)
         if trade_pair is None or ticker is None:
             return
+
+        if self.cfg.limit_entries:
+            self._enter_long_passive(action, trade_pair, ticker, now_ms, current_bar)
+            return
+
         quantity = self._quantise(trade_pair, action.quantity, ticker.mid)
         if quantity is None:
             self.journal.order(now_ms, action.to_dict(), error="below pair minimum")
@@ -752,6 +771,78 @@ class TradingEngine:
         result = self.client.place_order(action.pair, "BUY", trade_pair.round_qty(quantity), "MARKET")
         self.journal.order(now_ms, action.to_dict(), result=result)
         self._record_result(result, action, now_ms, current_bar)
+
+    def _limit_price(self, pair: str, trade_pair: TradePair, ticker: Ticker) -> float:
+        """The passive bid: a touch below the mid, rounded to the pair's tick."""
+        offset = self.cfg.limit_entry_offset_bps / 10_000.0
+        return float(fmt(ticker.mid * (1.0 - offset), trade_pair.price_precision))
+
+    def _enter_long_passive(
+        self, action: ApprovedAction, trade_pair: TradePair, ticker: Ticker, now_ms: int, current_bar: int
+    ) -> None:
+        """Post a resting maker bid instead of crossing the spread.
+
+        Sized from the *limit* price rather than the mid, so the notional the risk
+        layer approved is the notional we end up holding -- a fill below the mid at
+        mid-based sizing would quietly exceed the cap.
+
+        The order is tracked in ``self._resting`` purely so it can be cancelled if
+        it goes stale. `_refresh_pending` already asks the venue for resting
+        orders, so the risk layer reserves the capital for this pair on the next
+        bar and will not size a second entry on top of it.
+        """
+        if action.pair in self._resting:
+            # One resting bid per pair is enough; the risk layer agrees.
+            return
+        price = self._limit_price(action.pair, trade_pair, ticker)
+        if price <= 0:
+            return
+        quantity = self._quantise(trade_pair, action.quantity, price)
+        if quantity is None:
+            self.journal.order(now_ms, action.to_dict(), error="below pair minimum at the limit price")
+            return
+
+        self.stats.orders_sent += 1
+        self.stats.orders_posted += 1
+        result = self.client.place_order(
+            action.pair, "BUY", trade_pair.round_qty(quantity), "LIMIT", price=price
+        )
+        self.journal.order(now_ms, action.to_dict(), result=result)
+        if result.status in ("FILLED", "PENDING"):
+            self._resting[action.pair] = (current_bar, price)
+        if result.status == "PENDING":
+            log.info("%s: resting bid %s for %s (maker)", action.pair, price, quantity)
+            return
+        self._record_result(result, action, now_ms, current_bar)
+
+    def _expire_resting_orders(self, now_ms: int, current_bar: int) -> None:
+        """Cancel maker entries that have gone stale, so capital is not locked up.
+
+        A resting order is capital committed and invisible: if the reversion has
+        already happened by the time it would fill, the entry is no longer the one
+        the strategy asked for. Cancelling is what bounds that exposure -- without
+        it, a bid below the market can sit there through the whole move.
+        """
+        if not self._resting:
+            return
+        timeout = max(1, int(self.cfg.limit_entry_timeout_bars))
+        for pair, (placed_bar, price) in list(self._resting.items()):
+            if current_bar - placed_bar < timeout:
+                continue
+            try:
+                cancelled = self.client.cancel_order(pair=pair)
+            except Exception as exc:
+                # Leave it in the book and try again next loop; a cancel that
+                # failed must not be assumed to have happened.
+                log.warning("%s: could not cancel the stale resting bid: %s", pair, exc)
+                self.journal.error("cancel", str(exc), ts_ms=now_ms, pair=pair, price=price)
+                continue
+            self._resting.pop(pair, None)
+            self.stats.orders_cancelled += 1
+            log.info("%s: cancelled the stale resting bid at %s (%s)", pair, price, cancelled)
+            self.journal.event(
+                "order_cancelled", ts_ms=now_ms, pair=pair, price=price, cancelled=cancelled, reason="stale entry"
+            )
 
     def _enter_short(self, action: ApprovedAction, now_ms: int, current_bar: int) -> None:
         collateral = max(1.0, round(action.collateral, 2))

@@ -589,6 +589,108 @@ class TestTextEncodingGuard(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+class TestLimitEntries(unittest.TestCase):
+    """Maker entries: post a resting bid, and cancel it if it goes stale.
+
+    `docs/FINDINGS.md` 6b.1 measures this as worth +0.047% per trade -- real, and
+    about a seventh of the loss. These tests pin the mechanics, not the benefit;
+    the benefit has to be re-measured in the live journal, because the simulator
+    does not model a resting bid being filled by an intrabar low.
+    """
+
+    def _engine(self, directory: Path, **cfg_overrides: object) -> tuple[TradingEngine, _StatefulClient]:
+        client = _StatefulClient()
+        cfg = make_config(directory)
+        for key, value in cfg_overrides.items():
+            setattr(cfg, key, value)
+        engine = TradingEngine(cfg, client=client)
+        self.addCleanup(engine.journal.close)
+        engine.exchange_pairs = {PAIR: trade_pair()}
+        engine.tickers = {PAIR: ticker(PAIR, 100.0)}
+        return engine, client
+
+    def _action(self) -> ApprovedAction:
+        return ApprovedAction(pair=PAIR, action=ENTER_LONG, quantity=1.0, notional=100.0, reason="test")
+
+    def test_the_limit_price_is_the_mid_rounded_to_the_tick(self) -> None:
+        with scratch_dir() as d:
+            engine, _ = self._engine(d, limit_entries=True)
+            pair = engine.exchange_pairs[PAIR]
+            engine.tickers[PAIR] = ticker(PAIR, 100.456)
+            self.assertEqual(engine._limit_price(PAIR, pair, engine.tickers[PAIR]), 100.45)
+
+    def test_a_positive_offset_bids_below_the_mid(self) -> None:
+        with scratch_dir() as d:
+            engine, _ = self._engine(d, limit_entries=True, limit_entry_offset_bps=10.0)
+            pair = engine.exchange_pairs[PAIR]
+            engine.tickers[PAIR] = ticker(PAIR, 100.0)
+            # 10bp below 100.00 is 99.90
+            self.assertEqual(engine._limit_price(PAIR, pair, engine.tickers[PAIR]), 99.90)
+
+    def test_entries_are_posted_as_limit_orders_when_enabled(self) -> None:
+        with scratch_dir() as d:
+            engine, client = self._engine(d, limit_entries=True)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            self.assertEqual(len(client.orders_placed), 1)
+            _pair, _side, _qty, order_type, price = client.orders_placed[0]
+            self.assertEqual(order_type, "LIMIT")
+            self.assertAlmostEqual(price, 100.0, places=2)
+            self.assertIn(PAIR, engine._resting)
+            self.assertEqual(engine.stats.orders_posted, 1)
+
+    def test_entries_stay_market_orders_by_default(self) -> None:
+        with scratch_dir() as d:
+            engine, client = self._engine(d)  # limit_entries defaults to False
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            self.assertEqual(client.orders_placed[0][3], "MARKET")
+            self.assertEqual(engine._resting, {})
+
+    def test_a_stale_bid_is_cancelled_and_forgotten(self) -> None:
+        with scratch_dir() as d:
+            engine, client = self._engine(d, limit_entries=True, limit_entry_timeout_bars=1)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            self.assertIn(PAIR, engine._resting)
+
+            # Same bar: still fresh, must survive.
+            engine._expire_resting_orders(1_800_000_000_000, 5)
+            self.assertIn(PAIR, engine._resting)
+
+            # One bar later: stale, so it is cancelled.
+            engine._expire_resting_orders(1_800_000_060_000, 6)
+            self.assertNotIn(PAIR, engine._resting)
+            self.assertEqual(client.cancelled, [PAIR])
+            self.assertEqual(engine.stats.orders_cancelled, 1)
+
+    def test_a_cancel_that_fails_keeps_the_order_tracked(self) -> None:
+        """Assuming a failed cancel happened would leak the reservation forever."""
+        with scratch_dir() as d:
+            engine, client = self._engine(d, limit_entries=True, limit_entry_timeout_bars=1)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            client.cancel_raises = True
+            engine._expire_resting_orders(1_800_000_060_000, 6)
+            self.assertIn(PAIR, engine._resting, "a failed cancel must be retried, not assumed")
+            self.assertEqual(engine.stats.orders_cancelled, 0)
+
+    def test_only_one_bid_is_posted_per_pair(self) -> None:
+        with scratch_dir() as d:
+            engine, client = self._engine(d, limit_entries=True)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            self.assertEqual(len(client.orders_placed), 1, "a second bid was stacked on the first")
+
+    def test_sizing_uses_the_limit_price_not_the_mid(self) -> None:
+        """A fill below the mid at mid-based sizing would exceed the approved cap."""
+        with scratch_dir() as d:
+            engine, client = self._engine(d, limit_entries=True, limit_entry_offset_bps=100.0)
+            engine._enter_long(self._action(), 1_800_000_000_000, 5)
+            _pair, _side, qty, _type, price = client.orders_placed[0]
+            self.assertAlmostEqual(price, 99.0, places=2)  # 100bp below 100
+            # quantity * limit price must not exceed the approved 100.0 notional
+            self.assertLessEqual(float(qty) * price, 100.0 + 1e-9)
+
+
+
+# ---------------------------------------------------------------------------
 class TestEdgeAnalysisTool(unittest.TestCase):
     """The analysis tool decides whether a change is worth making, so it is tested.
 
@@ -759,7 +861,11 @@ class _StatefulClient:
         self._short_rows = short_rows if short_rows is not None else []
         self._order_rows = order_rows if order_rows is not None else []
         self.short_positions_raises = False
+        self.cancel_raises = False
+        #: (pair, side, qty, order_type, price) for every order attempted.
         self.orders_placed: list[tuple] = []
+        #: pairs passed to cancel_order.
+        self.cancelled: list[str] = []
 
     def sync_time(self) -> int:
         return 0
@@ -777,22 +883,31 @@ class _StatefulClient:
         return 0, {}
 
     def place_order(self, pair, side, qty, order_type="MARKET", price=None):
-        self.orders_placed.append((pair, side, qty))
+        self.orders_placed.append((pair, side, qty, order_type, price))
+        # A limit order that does not cross rests, exactly as the real client and
+        # the simulator both report it. Modelling it as an instant fill would make
+        # the maker path look like free money.
+        resting = order_type.upper() == "LIMIT" and price is not None
         return OrderResult(
             pair=pair,
             side=side,
             order_type=order_type,
             quantity=float(qty),
-            price=0.0,
-            status="FILLED",
-            filled_quantity=float(qty),
-            avg_fill_price=60_000.0,
+            price=float(price or 0.0),
+            status="PENDING" if resting else "FILLED",
+            filled_quantity=0.0 if resting else float(qty),
+            avg_fill_price=0.0 if resting else 60_000.0,
         )
 
     def query_orders(self, **kwargs) -> list:
         return list(self._order_rows)
 
     def cancel_order(self, *args, **kwargs) -> list:
+        if self.cancel_raises:
+            raise RuntimeError("simulated cancel failure")
+        pair = kwargs.get("pair")
+        if pair:
+            self.cancelled.append(pair)
         return []
 
     def short_positions(self) -> list:
