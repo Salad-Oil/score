@@ -30,6 +30,7 @@ Execution model, chosen to avoid the usual ways a backtest lies to you:
 """
 
 from __future__ import annotations
+from .strategies.scoring import execution_terms
 
 import logging
 import math
@@ -212,6 +213,9 @@ class Backtester:
     ) -> None:
         self.cfg = cfg
         self.strategy = strategy
+        configure = getattr(self.strategy, "configure_execution", None)
+        if configure is not None:
+           configure(cfg)
         configure = getattr(self.strategy, "configure_execution", None)
         if configure is not None:
             configure(cfg)
