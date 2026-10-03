@@ -73,8 +73,15 @@ def span_window(interval: str) -> int:
     return max(4, round(BASE_SPAN_SECONDS / seconds))
 
 
+#: OHLC series per pair, keyed by file name. `load()` fills this so that the
+#: limit-order model can see the intrabar range without changing the shape of the
+#: tuples every other part already unpacks.
+_SERIES: dict[str, tuple[list[float], list[float], list[float]]] = {}
+
+
 def load(data_dir: Path, interval: str, window: int, adx_period: int):
     """(name, closes, z, adxs, deviations) per pair, aligned to bar index."""
+    _SERIES.clear()
     out = []
     files = sorted(f for f in data_dir.glob(f"*-USD_{interval}.csv") if not f.name.startswith("sample_"))
     if not files:
@@ -85,6 +92,7 @@ def load(data_dir: Path, interval: str, window: int, adx_period: int):
         closes = [float(r["close"]) for r in rows]
         highs = [float(r["high"]) for r in rows]
         lows = [float(r["low"]) for r in rows]
+        _SERIES[path.name] = (highs, lows, closes)
         sma, sd = sma_series(closes, window), stdev_series(closes, window)
         z: list[float] = []
         dev: list[float] = []
@@ -103,14 +111,14 @@ def load(data_dir: Path, interval: str, window: int, adx_period: int):
 
 
 def entries(data, window: int, z_entry: float, adx_max: float | None, gate: float | None):
-    """Yield (bar, i, closes, z) per surviving Rule 2 long entry.
+    """Yield (name, bar, i, closes, z) per surviving Rule 2 long entry.
 
     ``bar`` is the signal bar; the trade fills on ``bar + 1`` (see
     :func:`forward_return`). The bound leaves room for the fill bar, the horizon
     and the last z lookup, so no entry is scored past the end of the series.
     """
     off = window - 1
-    for _name, closes, z, adxs, dev in data:
+    for name, closes, z, adxs, dev in data:
         for i in range(1, len(z)):
             bar = off + i
             if bar + HORIZON_BARS + 2 >= len(closes):
@@ -123,7 +131,7 @@ def entries(data, window: int, z_entry: float, adx_max: float | None, gate: floa
                     continue
             if gate is not None and dev[i] <= gate:
                 continue
-            yield bar, i, closes, z
+            yield name, bar, i, closes, z
 
 
 def forward_return(i: int, closes: list[float], z: list[float]) -> float:
@@ -146,12 +154,59 @@ def forward_return(i: int, closes: list[float], z: list[float]) -> float:
     return px / entry - 1.0
 
 
+def maker_entry(
+    name: str,
+    i: int,
+    closes: list[float],
+    z: list[float],
+    offset_bps: float,
+    model: str,
+) -> tuple[float, bool]:
+    """Return ``(return, filled)`` for a passive limit entry on the fill bar.
+
+    A mean-reversion long is the natural case for a resting bid: the signal is
+    "price just fell hard", so a bid at the signal bar's close is often filled by
+    the very move that produced the signal, and it pays the maker fee instead of
+    the taker fee.
+
+    **The fill assumption is the whole argument, so both readings are reported.**
+    ``model="touch"`` fills whenever the bar's low reaches the limit, which
+    implicitly assumes we are at the front of the queue. ``model="through"``
+    demands the bar trade strictly below it -- the pessimistic reading, and the
+    one to quote when deciding.
+
+    The order rests for one bar (bar ``i + 1``) and is cancelled if unfilled, so an
+    unfilled signal produces NO trade at all. That is the honest cost of the
+    approach: fewer trades, not the same trades for less money.
+    """
+    if model not in ("touch", "through"):
+        raise ValueError(f"unknown fill model {model!r}")
+
+    highs, lows, _closes = _SERIES[name]
+    fill_bar = i + 1
+    limit = closes[i] * (1.0 - offset_bps / 10_000.0)
+    low = lows[fill_bar]
+
+    filled = low <= limit if model == "touch" else low < limit
+    if not filled:
+        return 0.0, False
+
+    # Filled at the limit because we are passive, then held to the same target as
+    # the market-order case, so the only differences are the fee and the entry price.
+    px = closes[fill_bar + HORIZON_BARS]
+    for k in range(1, HORIZON_BARS + 1):
+        if z[fill_bar + k] >= RXIT_Z:
+            px = closes[fill_bar + k]
+            break
+    return px / limit - 1.0, True
+
+
 def part1(data, window, z_entry, adx_max, gate, interval) -> None:
     """Reversion measured from the FILL bar, which is where the position starts."""
     total = reverted = 0
     bars_to: list[int] = []
     adverse: list[float] = []
-    for _bar, i, _closes, z in entries(data, window, z_entry, adx_max, gate):
+    for _name, _bar, i, _closes, z in entries(data, window, z_entry, adx_max, gate):
         total += 1
         fill = i + 1
         entry_z = z[fill]
@@ -181,7 +236,10 @@ def part1(data, window, z_entry, adx_max, gate, interval) -> None:
 
 
 def part2(data, window, z_entry, adx_max, gate, interval) -> None:
-    rets = [forward_return(i, closes, z) for _b, i, closes, z in entries(data, window, z_entry, adx_max, gate)]
+    rets = [
+        forward_return(i, closes, z)
+        for _n, _b, i, closes, z in entries(data, window, z_entry, adx_max, gate)
+    ]
     if not rets:
         print("2. no entries\n")
         return
@@ -206,7 +264,7 @@ def part3(data, window, adx_max, gate, interval) -> None:
     for z_entry in (2.0, 2.5, 3.0, 3.5):
         early: list[float] = []
         late: list[float] = []
-        for bar, i, closes, z in entries(data, window, z_entry, adx_max, gate):
+        for _n, bar, i, closes, z in entries(data, window, z_entry, adx_max, gate):
             (early if bar < len(closes) * SPLIT else late).append(forward_return(i, closes, z) - cost)
 
         def line(rs: list[float]) -> str:
@@ -233,14 +291,13 @@ def part4(data, window, adx_max, gate, interval, folds: int) -> None:
     market and loses in another, which no amount of parameter tuning repairs.
     """
     cost = 2 * (TAKER + SLIPPAGE)
+    n_by_name = {name: len(closes) for name, closes, _z, _a, _d in data}
     buckets: dict[float, list[list[float]]] = {}
     for z_entry in (2.0, 2.5, 3.0, 3.5):
         frames: list[list[float]] = [[] for _ in range(folds)]
-        for _name, closes, _z, _adxs, _dev in data:
-            n = len(closes)
-            for bar, i, _c, z in entries(data=[(_name, closes, _z, _adxs, _dev)], window=window,
-                                          z_entry=z_entry, adx_max=adx_max, gate=gate):
-                frames[min(folds - 1, int(bar / n * folds))].append(forward_return(i, closes, z) - cost)
+        for name, bar, i, closes, z in entries(data, window, z_entry, adx_max, gate):
+            n = n_by_name[name]
+            frames[min(folds - 1, int(bar / n * folds))].append(forward_return(i, closes, z) - cost)
         buckets[z_entry] = frames
 
     print(f"4. THE DECISIVE TEST: {folds} consecutive folds, same sign required in each")
@@ -264,6 +321,84 @@ def part4(data, window, adx_max, gate, interval, folds: int) -> None:
     print("   A rule worth trading is positive in most folds AND not negative in the last one.")
 
 
+def part5(data, window, z_entry, adx_max, gate, interval, offset_bps: float, folds: int) -> None:
+    """Market order versus a passive (maker) entry, on identical signals.
+
+    The bot sends market orders only (`engine.py` uses ``place_order(..., "MARKET")``),
+    so it pays the taker fee plus slippage on every entry. A resting bid at the
+    signal bar's close would pay the maker fee and no crossing cost -- but it is
+    only filled when price trades back to it, and an unfilled order means the trade
+    does not happen at all. Both readings of "filled" are reported, because the
+    answer to "would this have filled?" is exactly where a backtest flatters itself.
+    """
+    market_rets: list[float] = []
+    touch_rets: list[float] = []
+    through_rets: list[float] = []
+    touch_folds: list[list[float]] = [[] for _ in range(max(folds, 1))]
+    through_folds: list[list[float]] = [[] for _ in range(max(folds, 1))]
+    n_by_name = {name: len(closes) for name, closes, _z, _a, _d in data}
+    market_cost = 2 * (TAKER + SLIPPAGE)
+    maker_cost = TAKER + MAKER + 2 * SLIPPAGE
+
+    total = 0
+    for name, bar, i, closes, z in entries(data, window, z_entry, adx_max, gate):
+        total += 1
+        market_rets.append(forward_return(i, closes, z) - market_cost)
+
+        r_touch, filled_touch = maker_entry(name, i, closes, z, offset_bps, "touch")
+        if filled_touch:
+            net = r_touch - maker_cost
+            touch_rets.append(net)
+            if folds >= 2:
+                fold = min(len(touch_folds) - 1, int(bar / n_by_name[name] * len(touch_folds)))
+                touch_folds[fold].append(net)
+
+        r_through, filled_through = maker_entry(name, i, closes, z, offset_bps, "through")
+        if filled_through:
+            net = r_through - maker_cost
+            through_rets.append(net)
+            if folds >= 2:
+                fold = min(len(through_folds) - 1, int(bar / n_by_name[name] * len(through_folds)))
+                through_folds[fold].append(net)
+
+    if not total:
+        print("5. no entries\n")
+        return
+
+    def row(label: str, rets: list[float], sends: int) -> None:
+        if not rets:
+            print(f"   {label:34} {'no fills':>9}")
+            return
+        mean = statistics.mean(rets)
+        print(f"   {label:34} n={len(rets):4}  filled {100.0 * len(rets) / sends:5.1f}%  "
+              f"mean net {mean * 100:+.3f}%  win {100.0 * sum(1 for r in rets if r > 0) / len(rets):4.1f}%")
+
+    print(f"5. MARKET ORDER vs PASSIVE (MAKER) ENTRY, identical signals, limit at the signal close")
+    print(f"   signals sent {total};  market round trip {market_cost * 100:.2f}%, "
+          f"maker round trip {maker_cost * 100:.2f}%")
+    row("market order (what ships today)", market_rets, total)
+    row("limit, 'touch' fill model", touch_rets, total)
+    row("limit, 'through' fill model", through_rets, total)
+    print()
+    print("   'touch' assumes we are first in the queue; 'through' demands the bar trade")
+    print("   strictly below the limit. Quote the 'through' number when deciding.")
+    if folds >= 2 and touch_folds[0] is not None:
+        print()
+        print(f"   the same {len(touch_folds)}-fold test, for the two limit readings (net):")
+        for label, frames in (("touch  ", touch_folds), ("through", through_folds)):
+            cells = []
+            for rs in frames:
+                if len(rs) < 3:
+                    cells.append(f"{'n=' + str(len(rs)):>16}")
+                    continue
+                sd = statistics.stdev(rs)
+                se = sd / (len(rs) ** 0.5)
+                t = statistics.mean(rs) / se if se else 0.0
+                cells.append(f"{statistics.mean(rs) * 100:>+7.3f}%(t{t:>+4.1f})")
+            print(f"   {label} | " + " ".join(cells))
+    print()
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="data")
@@ -277,6 +412,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--adx-period", type=int, default=14)
     ap.add_argument("--folds", type=int, default=5,
                     help="consecutive folds for the decisive stability test (0 disables it)")
+    ap.add_argument("--maker", action="store_true",
+                    help="also compare a passive (maker) entry against the market order")
+    ap.add_argument("--limit-offset-bps", type=float, default=0.0,
+                    help="how far below the signal close the resting bid sits (default 0)")
     args = ap.parse_args(argv)
 
     window = args.window
@@ -294,6 +433,11 @@ def main(argv: list[str]) -> int:
     part3(data, window, adx_max, args.gate, args.interval)
     if args.folds >= 2:
         part4(data, window, adx_max, args.gate, args.interval, args.folds)
+    if args.maker:
+        part5(
+            data, window, args.z_entry, adx_max, args.gate, args.interval,
+            args.limit_offset_bps, args.folds,
+        )
     return 0
 
 

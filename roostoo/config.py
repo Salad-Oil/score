@@ -212,6 +212,21 @@ class Config:
     #: *full-size* position with no stop: Rule 7's 0.5% risk budget was reported
     #: as unenforceable and the size fell back to the per-pair cap.
     refuse_entry_without_stop: bool = True
+    #: Post entries as resting maker orders instead of crossing the spread. The
+    #: mean-reversion entry is the natural case for a passive bid -- the signal IS
+    #: "price just fell hard", so a bid at the quote is often filled by the same
+    #: move, and it pays 0.05% instead of 0.1% plus slippage. Measured effect on
+    #: the round trip is 0.30% -> 0.25%, worth about +0.047% per trade: real, and
+    #: about a seventh of the loss, not a fix (see docs/FINDINGS.md 6b.1).
+    #: Exits always cross -- a stop that rests is not a stop.
+    limit_entries: bool = False
+    #: How far below the mid the bid sits. 0 bids at the mid, which is where the
+    #: signal was born; positive values are more patient and fill less often.
+    limit_entry_offset_bps: float = 0.0
+    #: Cancel after this many bars unfilled. The measured fill rate is 95-99%
+    #: within one bar, so a longer window mostly buys exposure to a reversion that
+    #: has already happened.
+    limit_entry_timeout_bars: int = 1
 
     # costs
     taker_fee: float = DEFAULT_TAKER_FEE
@@ -280,6 +295,9 @@ class Config:
             trailing_stop_pct=_as_optional_float(env, "TRAILING_STOP_PCT", None),
             crash_filter_pct=_as_float(env, "CRASH_FILTER_PCT", 0.12),
             refuse_entry_without_stop=_as_bool(_get(env, "REFUSE_ENTRY_WITHOUT_STOP"), True),
+            limit_entries=_as_bool(_get(env, "LIMIT_ENTRIES"), False),
+            limit_entry_offset_bps=_as_float(env, "LIMIT_ENTRY_OFFSET_BPS", 0.0),
+            limit_entry_timeout_bars=_as_int(env, "LIMIT_ENTRY_TIMEOUT_BARS", 1),
             taker_fee=_as_float(env, "TAKER_FEE", DEFAULT_TAKER_FEE),
             maker_fee=_as_float(env, "MAKER_FEE", DEFAULT_MAKER_FEE),
             slippage_bps=_as_float(env, "SLIPPAGE_BPS", 5.0),
