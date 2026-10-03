@@ -362,9 +362,14 @@ class RoostooClient:
     # -- private (signed) ----------------------------------------------
     def balance(self) -> dict[str, WalletBalance]:
         payload = self._call("GET", PATH_BALANCE, {}, signed=True)
-        wallet = payload.get("Wallet") or {}
+        wallet = payload.get("SpotWallet") or payload.get("Wallet") or {}
+       
         return {
-            asset: WalletBalance(asset=asset, free=float(v.get("Free", 0.0) or 0.0), locked=float(v.get("Lock", 0.0) or 0.0))
+            asset: WalletBalance(
+               asset=asset, 
+               free=float(v.get("Free", 0.0) or 0.0), 
+               locked=float(v.get("Lock", 0.0) or 0.0),
+            )
             for asset, v in wallet.items()
         }
 
