@@ -54,6 +54,11 @@ PATH_SHORT_OPEN = "/v6/short_open"
 PATH_SHORT_CLOSE = "/v6/short_close"
 PATH_SHORT_POSITIONS = "/v6/short_positions"
 
+# Public endpoints that require a timestamp but do not require a signature.
+_TIMESTAMP_REQUIRED = {
+    PATH_TICKER,
+}
+
 # Endpoints that are documented to answer `Success: false` for a normal,
 # empty result rather than a genuine failure.
 _EMPTY_IS_NORMAL = {
@@ -243,8 +248,12 @@ class RoostooClient:
         """
         params = dict(params)
         headers = {"Accept": "application/json", "User-Agent": "roostoo-quant-bot/0.1"}
+
+        # Signed endpoints and RCL_TSCheck endpoints require a fresh timestamp.
+        if signed or path in _TIMESTAMP_REQUIRED:
+           params["timestamp"] = self.timestamp_ms()
+           
         if signed:
-            params["timestamp"] = self.timestamp_ms()
             body_str: Optional[str] = canonical_params(params)
             headers.update(self.sign_headers(params, canonical=body_str))
         else:
