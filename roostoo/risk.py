@@ -904,7 +904,7 @@ class RiskManager:
                     stop_price=sizing.stop_price,
                     risk_amount=sizing.risk_amount,
                     binding=sizing.binding,
-                    meta={**scored_meta), "strength": round(signal.strength, 4)},
+                    meta={**scored_meta, "strength": round(signal.strength, 4)},
                 )
             )
             projected_pairs.add(pair)
